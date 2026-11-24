@@ -133,6 +133,11 @@ inline bool& pipe_said() {
     static bool said = false;
     return said;
 }
+/* The same for the sparse attention's row form (`tp-attn-split: rows`). */
+inline bool& rows_said() {
+    static bool said = false;
+    return said;
+}
 
 struct Layer {
     bool sliding = false;
@@ -717,7 +722,9 @@ static int buffers(RadBuilder* b, Model& m) {
     m.cu_prefill = decl_b(b, nm.f("cu_prefill"), RAD_I32, { g.max_seqs + 1 });
     if (!m.cu_prefill) return RAD_E_INVAL;
     if (any_sparse)
-        RAD_ARCH_TRY(m.aw_sparse.declare(b, nm, s, s.sparse_r, T, m.cu_prefill, "sparse"));
+        RAD_ARCH_TRY(m.aw_sparse.declare(b, nm, s, s.sparse_r, T, m.cu_prefill, "sparse",
+                                         s.attn_rows ? &s.sparse : nullptr,
+                                         s.attn_rows ? std::max<int64_t>(1, T / s.world) : 0));
     if (any_sliding)
         RAD_ARCH_TRY(m.aw_sliding.declare(b, nm, s, s.sliding_r, T, m.cu_prefill, "sliding"));
     if (any_sparse) RAD_ARCH_TRY(m.iw.declare(b, nm, s, g));
@@ -953,6 +960,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(split_ranks(s, ctx->world_size ? ctx->world_size : 1, ctx->rank));
     s.calib_lo = ctx->calib_layer_lo;
     s.calib_hi = ctx->calib_layer_hi;
+    /* The row form's planes are not the ones a tap or the calibration reads. */
+    s.attn_rows = ctx->tp_attn_rows && s.world > 1 && !taps_on() && calib_dir() == nullptr;
     RAD_ARCH_TRY(geom_from(g, meta, ctx, "bf16", RAD_BF16));
     m.df.configure(b, meta, s, ctx);   /* before the trunk: the snapshots follow its indexers */
     /* The producers write bf16 planes only: a bf16 trunk linear reads them, an int8 one quantises
@@ -1126,7 +1135,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         for (rad_buf v : { m.tr.h, m.tr.post, m.tr.xn })
             if (v) rad_buf_concurrent(b, v);
         for (const Layer& l : m.layers)
-            for (rad_buf v : { l.attn.w.o, l.ffn.junction_a(), l.ffn.junction_b() })
+            for (rad_buf v : { l.attn.w.o, l.attn.w.r_o, l.ffn.junction_a(), l.ffn.junction_b() })
                 if (v) rad_buf_concurrent(b, v);
     }
     RAD_ARCH_TRY(m.t_final.declare(b, nm, T, "final_hidden", -1, RAD_BF16, E, m.final_hidden));
@@ -1219,6 +1228,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)s.sliding_r.heads, (long long)s.sliding.heads,
              s.world == 1 ? "all" : s.experts_whole ? "whole per rank" : "sliced per rank",
              taps_on() ? ", debug taps" : "");
+    if (s.attn_rows) {
+        int64_t bytes = 0;
+        for (const Layer& l : m.layers) bytes += l.attn.rows_weight_bytes;
+        rad_note(b,
+                 "tp-attn-split rows: the %lld sparse layers' attention splits a prefill step of "
+                 "%lld rows or more by rows (heads below it); about %.1f MiB more weights on this "
+                 "rank (whole views of q_b, kv_b, attn_gate and attn_output at a byte a code)",
+                 (long long)n_sparse, (long long)GlmTp::kSplitRows, (double)bytes / (1 << 20));
+    }
     return RAD_OK;
 }
 
@@ -1390,6 +1408,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
                 queries = &compact;
             }
         }
+        /* The row form (hyv4flash_attn.h): every rank the same run length, this rank's own run. */
+        if (!l.sliding && l.attn.rows_take(batch, lp, rows)) {
+            lp.rrows = lp.T / s.world;
+            lp.r0 = s.rank * lp.rrows;
+            lp.rlane = pipe && pipe_lane();
+            if (!rows_said()) {
+                rows_said() = true;
+                fprintf(stderr, "hyv4flash: sparse attention by rows, %lld rows a rank\n",
+                        (long long)lp.rrows);
+            }
+        }
+        const bool reduced = lp.rrows > 0;   /* attn.w.o is the full sum already */
         if (!l.attn.front(c, batch, queries, rows, lp)) return;
         m.calib.after_front(c, (int)i, l.attn, T);
         /* A pass on a streamed group's ring attends through the selection at every context
@@ -1411,18 +1441,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
                 move_rows(c, m.pack_post, m.tr.post, s.hc, src, dst, n);
             });
         const bool pipe_tail = pipe && jm && je;
-        auto junction = [&](const Junction& j) {
+        auto junction = [&](const Junction& j, bool red = false) {
             if (pipe_tail) {
-                pipe_issue(c, [&] { j.step(c, 0, rows.n, pipe_lane()); });
+                pipe_issue(c, [&] { j.step(c, 0, rows.n, pipe_lane(), red); });
                 pipe_join(c);
             } else {
-                j.step(c, rows.n);
+                j.step(c, rows.n, red);
             }
         };
         if (jm) {
             /* With both junctions split, the pieces below are this junction: running it whole here
              * as well would add the connection twice (and reduce twice). */
-            if (!pipe_tail || rows.ids) junction(l.j_mid);
+            if (!pipe_tail || rows.ids) junction(l.j_mid, reduced);
             l.attn.tail_taps(c, rows.n);
         }
         m.calib.after_attn(c, (int)i, rows.n);
@@ -1448,9 +1478,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
                 fprintf(stderr, "hyv4flash: pipelined prefill, %lld + %lld rows\n", (long long)n0,
                         (long long)n1);
             }
-            pipe_issue(c, [&] { l.j_mid.step(c, 0, n0, pipe_lane()); });
+            pipe_issue(c, [&] { l.j_mid.step(c, 0, n0, pipe_lane(), reduced); });
             pipe_join(c);
-            pipe_issue(c, [&] { l.j_mid.step(c, n0, n1, pipe_lane()); });
+            pipe_issue(c, [&] { l.j_mid.step(c, n0, n1, pipe_lane(), reduced); });
             l.ffn.body(c, rows.n, 0, n0);
             pipe_join(c);
             pipe_issue(c, [&] { l.j_end.step(c, 0, n0, pipe_lane()); });
@@ -1528,6 +1558,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * request keeps m = 1. S-02b declares the set and reports 1 here when the trunk can stop
      * between two layers (no taps, no calibration window). */
     out->slice_layers_ok = 0;
+    /* `tp-attn-split: rows`: the sparse layers' prefill attention by rows (hyv4flash_attn.h). */
+    out->tp_attn_rows_ok = 1;
     /* declare() honours RadBuildCtx::shape_probe (probe_model above): the core sizes the arena's
      * levels, lends their tops to the expert slab and arms the prefill stager. */
     {   /* RADIANCE_HY4_SHAPE_PROBE=0: no sizing declares (an A/B switch, hy4-perf). */

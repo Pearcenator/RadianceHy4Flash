@@ -78,6 +78,10 @@ struct Shape {
      * width (n_ff_exp_r, the quantised serving form). Everything else is replicated. The geometry
      * above stays the model's: the drafter and the tower are declared whole. */
     int world = 1, rank = 0;
+    /* `tp-attn-split: rows` (RadBuildCtx::tp_attn_rows) at more than one rank, with no tap and no
+     * calibration reading the attention's planes: the sparse layers' attention splits a prefill
+     * step by rows instead of heads (hyv4flash_attn.h, "The row form"). */
+    bool attn_rows = false;
     /* --calib-layers (RadBuildCtx::calib_layer_lo .. calib_layer_hi, hi exclusive; both 0: every layer). */
     int calib_lo = 0, calib_hi = 0;
     AttnGeom sparse_r{}, sliding_r{};
@@ -450,8 +454,9 @@ struct Lin : LinearFP8 {
                 std::initializer_list<const char*> src, const ActFP8& a, rad_buf y,
                 int64_t max_rows = 0, std::initializer_list<int64_t> row_parts = {},
                 int64_t span_lo = 0, int64_t span_hi = 0) {
-        const char* wn = nm.f("%s.weight", base);
-        if (!mapped) RAD_ARCH_TRY(map_linear(b, wn, src));   /* a row map is the caller's */
+        /* A view of another stored weight (LinearFP8::stored) takes that weight's form and map. */
+        const char* wn = stored ? stored : nm.f("%s.weight", base);
+        if (!mapped && !stored) RAD_ARCH_TRY(map_linear(b, wn, src));   /* a row map is the caller's */
         mapped = true;
         RadEncoding e{};
         const bool known = weight_enc(b, wn, &e);
@@ -826,7 +831,9 @@ struct Junction {
         }
         return RAD_OK;
     }
-    void step(RadCtx* c, int64_t T) const {
+    /* `reduced`: `a` is already the full sum on every rank (the attention's row form gathered it),
+     * so neither reduction runs and the plain row reads it as at one rank. */
+    void step(RadCtx* c, int64_t T, bool reduced = false) const {
         const RadOperand B = b ? brows(b, T) : RAD_NONE;
         auto issue = [&](rad_op o, RadOperand bb) {
             RAD_ISSUE_N(c, o, T, brows(a, T), bb, RAD_W(w_post), brows(post, T), brows(h, T),
@@ -836,6 +843,7 @@ struct Junction {
                         x ? brows(x, T) : RAD_NONE, codes.q8 ? brows(codes.q8, T) : RAD_NONE,
                         codes.s8 ? brows(codes.s8, T) : RAD_NONE);
         };
+        if (reduced) { issue(op, B); return; }
         if (op_ar && T <= ar_rows) { issue(op_ar, B); return; }
         if (world > 1) {
             if (b) RAD_ISSUE_N(c, op_add, T, brows(a, T), brows(b, T), brows(a, T));
@@ -850,7 +858,7 @@ struct Junction {
      * lane; the fused `op_ar` never runs here (it takes the whole band, so it is only for a small
      * T). Nothing in the chain steps outside a row, so a piece's rows are the same numbers as the
      * whole step's. */
-    void step(RadCtx* c, int64_t r0, int64_t rows, bool beside) const {
+    void step(RadCtx* c, int64_t r0, int64_t rows, bool beside, bool reduced = false) const {
         if (rows <= 0) return;
         auto row = [&](rad_buf v, int64_t pitch) { return brow_slice(v, r0, rows, pitch); };
         const RadOperand B = b ? row(b, n) : RAD_NONE;
@@ -861,6 +869,7 @@ struct Junction {
                         xn ? row(xn, n) : RAD_NONE, y ? row(y, n) : RAD_NONE,
                         x ? row(x, n) : RAD_NONE);
         };
+        if (reduced) { issue(op, B); return; }
         if (op_ar && rows <= ar_rows && !beside) { issue(op_ar, B); return; }
         if (world > 1) {
             const rad_op red = beside && op_reduce_ov ? op_reduce_ov : op_reduce;

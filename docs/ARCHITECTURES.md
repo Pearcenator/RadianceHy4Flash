@@ -3609,6 +3609,26 @@ serves a bf16 expert only whole. At more than one rank the taps of a rank's part
 (`attn_gate_logits`, `moe_experts_out`, `moe_routed_out`, `moe_shared_out`) are left out and
 `attn_o_proj` is tapped behind its reduction.
 
+**The sparse attention by rows** (`tp-attn-split: rows`, off by default; `Attn::rows_take` and
+`Attn::core_rows` in `hyv4flash_attn.h`). A sparse layer's selecting prefill step splits by rows
+instead of heads: rank r runs rows `[r * T / world, (r + 1) * T / world)` at every head (32 of 32),
+one `mla_attn_sel_sink` launch a rank at a quarter of the rows, and an `all_gather` of whole rows
+takes the place of that layer's attention all-reduce (the mid junction then adds without a
+reduction). The form is built to write the head form's bytes: `attn_output` runs as `world` column
+shares, each the GEMM a rank of the head form runs (the same codes, scales, K and N), and the
+partials are folded as the exact all-reduce folds them, in f32 from +0 in rank order and narrowed
+to bf16 once (`fill`, `cast`, `add`, `cast`). A step keeps the head form when it has decode rows,
+a compact last-layer pass, fewer than 256 rows, rows that do not divide by the ranks, runs of 64
+rows or fewer (the narrow int8 GEMM's band, so at four ranks the floor is 260 rows), a streamed
+latent group, a three-component rotary table (media rows), or when it does not select (a context
+inside the dense limit). Taps and a calibration run keep the head form everywhere. With
+`RADIANCE_HY4_PIPE` the gather rides the pipeline's lane. The price is `q_b`, `kv_b`, the gate and
+every rank's share of `attn_output` on every rank for the sparse layers; the startup note states the
+bytes. Checked on the host reference (`tests/ref_hy4_ops_test.cpp`: the layer's output bytes, head
+against rows, at two and four ranks) and on the SIMT emulator (`tests/r4d_emu/test_mla_sink.cpp`:
+a run of rows and a group of heads against the whole launch, byte for byte); not yet measured on
+cards, where the int8 GEMMs run a quarter of the rows at four times the width.
+
 ### Pictures and video
 
 Served when the deployment leaves room for an encoder pass (`--mm-max-patches`) and the config

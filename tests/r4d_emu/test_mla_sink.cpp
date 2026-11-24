@@ -828,6 +828,53 @@ int main(int argc, char** argv) {
         p.sel_len = { 0, 77, 200 };
         check_forms("sel scattered", p, true);
     }
+    /* Hy4's sparse attention by rows (tp-attn-split rows): a rank launches a run of the step's
+     * rows at the whole 32 heads, `stable 0`, where the head form launches every row at its own 8.
+     * A row's bytes must not depend on the launch's rows or on which heads share it: the whole
+     * step against its four runs (each past the 64 rows a run needs), and 32 heads against the
+     * four groups of 8. */
+    {
+        Problem p;
+        const int n = 66, M = 4 * n, H = 32;
+        make_paged(p, { M }, { M }, H, 4, 0, false, rng);
+        make_sel_from_paged(p);
+        for (int r = 0; r < M; ++r) p.sel_len[r] = r % 5 == 3 ? 0 : 1 + (r * 7) % 61;
+        std::vector<uint16_t> whole, part;
+        bool ok = launch(p, true, 0, whole, 0) == RAD_OK, rows_same = ok, heads_same = ok;
+        for (int k = 0; ok && k < 4; ++k) {
+            Problem s = p;
+            s.cu = { 0, n };
+            s.q.assign(p.q.begin() + (size_t)k * n * H * L, p.q.begin() + (size_t)(k + 1) * n * H * L);
+            s.qr.assign(p.qr.begin() + (size_t)k * n * H * R,
+                        p.qr.begin() + (size_t)(k + 1) * n * H * R);
+            s.sel_bt.assign(p.sel_bt.begin() + (size_t)k * n * p.sel_blocks,
+                            p.sel_bt.begin() + (size_t)(k + 1) * n * p.sel_blocks);
+            s.sel_len.assign(p.sel_len.begin() + k * n, p.sel_len.begin() + (k + 1) * n);
+            rows_same = launch(s, true, 0, part, 0) == RAD_OK &&
+                        !std::memcmp(part.data(), whole.data() + (size_t)k * n * H * L,
+                                     part.size() * 2) && rows_same;
+            /* the head form's shard: heads [8k, 8k + 8) of every row */
+            Problem h = p;
+            h.heads = 8;
+            h.q.clear();
+            h.qr.clear();
+            for (int r = 0; r < M; ++r) {
+                const size_t at = (size_t)r * H + (size_t)k * 8;
+                h.q.insert(h.q.end(), p.q.begin() + at * L, p.q.begin() + (at + 8) * L);
+                h.qr.insert(h.qr.end(), p.qr.begin() + at * R, p.qr.begin() + (at + 8) * R);
+            }
+            h.sinks.assign(p.sinks.begin() + k * 8, p.sinks.begin() + (k + 1) * 8);
+            bool same = launch(h, true, 0, part, 0) == RAD_OK;
+            for (int r = 0; same && r < M; ++r)
+                same = !std::memcmp(part.data() + (size_t)r * 8 * L,
+                                    whole.data() + ((size_t)r * H + (size_t)k * 8) * L, 8 * L * 2);
+            heads_same = heads_same && same;
+        }
+        report("sel stable 0, 32 heads: a run of 66 rows == its rows of the 264-row launch (bytes)",
+               rows_same);
+        report("sel stable 0: 8 heads a launch == those heads of the 32-head launch (bytes)",
+               heads_same);
+    }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;
 }

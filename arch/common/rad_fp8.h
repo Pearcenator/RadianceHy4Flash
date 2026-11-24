@@ -1444,9 +1444,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                       lora_plain_view_src(src);
     bf16 = g.w_bf16 || plain || view;
     if (bf16) {
-        if (stored) {
-            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
-                            "may\n", wn, stored);
+        /* A whole or spanned view of another stored bf16 weight (Hy4's row-form attention); the
+         * LoRA detour reads its own planes. */
+        if (stored && view) {
+            fprintf(stderr, "radiance: '%s' views '%s', which only a plain bf16, int8 or "
+                            "block-fp8 linear may\n", wn, stored);
             return RAD_E_INVAL;
         }
         if (known && !plain && !view) {
@@ -1471,6 +1473,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
          * plain bf16, the form the core's LoRA pools and weight_share expect (lora.cpp). */
         w = view ? decl_view(b, wn, nullptr, "codes,scale", RAD_I8, { N, K }, access, shard, grp,
                              rp.w, rp.n)
+                 : stored ? decl_view(b, wn, stored, nullptr, RAD_BF16, { N, K }, access, shard,
+                                      grp, rp.w, rp.n)
                  : decl_w_n(b, wn, RAD_BF16, { N, K }, access, shard, grp, 0, rp.w, rp.n);
         if (!w) return RAD_E_INVAL;
         if (span_hi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
@@ -1497,11 +1501,6 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     i8 = known && (linear_is_w8(enc) || rot8);
     i8_rot = i8 && rot8;
     if (i8) {
-        if (stored) {
-            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
-                            "may\n", wn, stored);
-            return RAD_E_INVAL;
-        }
         if (a.q8_fed && rot8 != a.q8_rot) {
             fprintf(stderr, "radiance: '%s' is a%s int8 weight and its input is fed codes its "
                             "producer wrote %s\n", wn, rot8 ? " rotated" : " plain",
@@ -1546,19 +1545,19 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                                                 : "codes";
         /* Declared at the stored codes' dtype; the kernel's layout keeps them at that width
          * (libr4d's r4d_iqr_layout.cpp). */
-        w  = decl_view(b, wn, nullptr, cv, enc.plane[0].dtype, { N, K }, access, shard, grp,
+        w  = decl_view(b, wn, stored, cv, enc.plane[0].dtype, { N, K }, access, shard, grp,
                        rp.w, rp.n);
         /* A view of two planes is declared at the weight's logical extents and sliced in its
          * columns, the stored planes left to the layout hook. */
         const bool iq8r = linear_is_iq8r(enc);
         const bool two = linear_w8h_scale2(enc) || linear_w8h_rowf(enc) || iq8r;
-        ws = asym ? decl_view(b, sn, wn, "scale,zero", RAD_F16, { N, K }, access, shard, grp,
+        ws = asym ? decl_view(b, sn, sw, "scale,zero", RAD_F16, { N, K }, access, shard, grp,
                               rp.w, rp.n)
-             : linear_w8h_rowf(enc) ? decl_view(b, sn, wn, "scale,scale.col", RAD_F32, { N, K },
+             : linear_w8h_rowf(enc) ? decl_view(b, sn, sw, "scale,scale.col", RAD_F32, { N, K },
                                                 access, shard, grp, rp.w, rp.n)
-             : two ? decl_view(b, sn, wn, "scale,scale.1", iq8r ? RAD_U8 : RAD_F8E4M3, { N, K },
+             : two ? decl_view(b, sn, sw, "scale,scale.1", iq8r ? RAD_U8 : RAD_F8E4M3, { N, K },
                                access, shard, grp, rp.w, rp.n)
-                   : decl_view(b, sn, wn, "scale", RAD_BF16, { N, K / wg }, access,
+                   : decl_view(b, sn, sw, "scale", RAD_BF16, { N, K / wg }, access,
                                shard, grp, rp.w, rp.n);
         if (!w || !ws) return RAD_E_INVAL;
         if (span_hi > 0) {

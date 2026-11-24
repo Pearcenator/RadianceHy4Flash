@@ -20,6 +20,7 @@
 #include <deque>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 #include <dlfcn.h>
 
@@ -647,6 +648,194 @@ TEST(the_absorbed_path_equals_the_non_absorbed_path_on_the_same_inputs) {
     std::vector<float> want((size_t)(m * H * vd));
     for (size_t i = 0; i < want.size(); ++i) want[i] = o1.at((int64_t)i);
     CHECK(worst(o2, want.data(), m * H * vd, 1e-4, 1e-5) <= 1.0);
+}
+
+/* ================================================================== the attention's row form
+ * `tp-attn-split: rows` (arch/hyv4flash/hyv4flash_attn.h, "The row form"): at more than one rank a
+ * sparse layer's prefill attention runs by rows at the model's whole head count, and its output
+ * must be the head split's bytes. This is that claim on the reference ops, the two graphs written
+ * out as the plugin issues them: the head form (each rank its heads over every row, then the exact
+ * all-reduce) against the row form (each rank its rows over every head, o_proj as one GEMM a
+ * rank's columns, the partials widened and added in rank order onto +0 and narrowed once, then an
+ * all_gather of whole rows). */
+namespace {
+int64_t count(const T& x) {
+    int64_t n = 1;
+    for (uint32_t i = 0; i < x.t.rank; ++i) n *= x.t.shape[i];
+    return n;
+}
+/* Rows [r0, r0 + rn) and columns [c0, c0 + cn) of a [rows, cols] tensor (a vector is one column
+ * a row), contiguous. */
+T cut(const T& x, int64_t r0, int64_t rn, int64_t c0, int64_t cn) {
+    const int64_t C = x.t.rank == 2 ? x.t.shape[1] : 1, e = dt_bytes(x.t.dtype, 1);
+    T y = x.t.rank == 2 ? T(x.t.dtype, { rn, cn }) : T(x.t.dtype, { rn });
+    for (int64_t r = 0; r < rn; ++r)
+        std::memcpy(y.mem.data() + r * cn * e, x.mem.data() + ((r0 + r) * C + c0) * e,
+                    (size_t)(cn * e));
+    return y;
+}
+int run_at(const char* op, A& args, int rank, int world) {
+    const RadKernelInfo* k = kern(op);
+    if (!k || !k->launch) return RAD_E_NOKERNEL;
+    args.get();
+    args.a.rank = rank;
+    args.a.world_size = world;
+    return k->launch(&args.a, nullptr);
+}
+/* One collective on every rank at once (libref's ranks are threads): `x[r]` is rank r's operands. */
+bool collective(const char* op, std::vector<A>& x) {
+    const int world = (int)x.size();
+    std::vector<int> rc((size_t)world, -1);
+    std::vector<std::thread> th;
+    for (int r = 0; r < world; ++r)
+        th.emplace_back([&, r] { rc[(size_t)r] = run_at(op, x[(size_t)r], r, world); });
+    for (auto& t : th) t.join();
+    return std::all_of(rc.begin(), rc.end(), [](int v) { return v == (int)RAD_OK; });
+}
+/* The exact all-reduce of `world` bf16 partials [rows, cols], on rank 0's copy. */
+T reduced(std::vector<T> part, int64_t rows, int64_t cols) {
+    std::vector<A> a(part.size());
+    for (size_t r = 0; r < part.size(); ++r)
+        a[r].t(part[r]).i("world_size", (long long)part.size()).i("numel", rows * cols)
+            .s("dtype", "bf16").i("exact", 1);
+    if (!collective("all_reduce", a)) std::exit(3);
+    for (size_t r = 1; r < part.size(); ++r)
+        if (part[r].mem != part[0].mem) std::exit(4);   /* every rank the same sum */
+    return part[0];
+}
+/* The row form's fold of the same partials: +0, each widened and added in rank order, one
+ * narrowing. `widen_first` is the fold that seeds with the first partial instead (wrong: -0). */
+T folded(const std::vector<T>& part, int64_t rows, int64_t cols, bool widen_first = false) {
+    T acc(RAD_F32, { rows, cols }), tmp(RAD_F32, { rows, cols }), out(RAD_BF16, { rows, cols });
+    auto widen = [&](const T& x, T& y) {
+        A c; c.t(x).t(y).i("M", rows).i("n", cols).s("from", "bf16").s("to", "f32");
+        if (run("cast", c) != (int)RAD_OK) std::exit(5);
+    };
+    size_t first = 0;
+    if (widen_first) {
+        widen(part[0], acc);
+        first = 1;
+    } else {
+        A f; f.t(acc).i("M", rows).i("n", cols).s("dtype", "f32").d("value", 0.0);
+        if (run("fill", f) != (int)RAD_OK) std::exit(5);
+    }
+    for (size_t j = first; j < part.size(); ++j) {
+        widen(part[j], tmp);
+        A ad; ad.t(acc).t(tmp).t(acc).i("M", rows).i("n", cols).s("dtype", "f32");
+        if (run("add", ad) != (int)RAD_OK) std::exit(5);
+    }
+    A nr; nr.t(acc).t(out).i("M", rows).i("n", cols).s("from", "f32").s("to", "bf16");
+    if (run("cast", nr) != (int)RAD_OK) std::exit(5);
+    return out;
+}
+}  // namespace
+
+TEST(the_sparse_attention_by_rows_writes_the_head_splits_bytes_at_two_and_four_ranks) {
+    for (int world : { 2, 4 }) {
+        const int64_t HW = 8, H = HW / world, kd = 6, R = 4, vd = 8, L = 16, E = 24, QL = 12;
+        const int64_t Tn = 8, n = Tn / world, N = 22, bs = 4, P = (N + bs - 1) / bs;
+        const int64_t KV = kd + vd, Wv = H * vd;
+        const double scale = std::pow((double)(kd + R), -0.5);
+        auto rnd = [](T& x, int64_t salt, float amp) {
+            for (int64_t i = 0; i < count(x); ++i)
+                st_dt(x.t.dtype, x.t.data, i,
+                      (float)std::sin(0.7 * (double)(i * 31 + salt * 17 + 3)) * amp);
+        };
+        /* What every rank holds whole: the layer's inputs, the cache and the selection, and (for
+         * the row form) the weights. */
+        T qa(RAD_BF16, { Tn, QL }), xin(RAD_BF16, { Tn, E }), cache(RAD_BF16, { P, 1, bs, L + R });
+        T sel(RAD_I32, { Tn, P }), len(RAD_I32, { Tn }), sinks(RAD_F32, { HW });
+        T wqn(RAD_BF16, { HW * kd, QL }), wqr(RAD_BF16, { HW * R, QL }), wg(RAD_BF16, { HW * vd, E });
+        T wkv(RAD_BF16, { HW * KV, L }), wo(RAD_BF16, { E, HW * vd });
+        rnd(qa, 1, 0.9f); rnd(xin, 2, 1.3f); rnd(cache, 3, 0.8f); rnd(sinks, 4, 0.6f);
+        rnd(wqn, 5, 0.5f); rnd(wqr, 6, 0.5f); rnd(wg, 7, 0.4f); rnd(wkv, 8, 0.5f); rnd(wo, 9, 0.7f);
+        for (int64_t r = 0; r < Tn; ++r) {   /* each row its own page order and its own reach */
+            for (int64_t b = 0; b < P; ++b) st_int(RAD_I32, sel.t.data, r * P + b, (b + r) % P);
+            st_int(RAD_I32, len.t.data, r, 5 + (r * 7) % (N - 5));
+        }
+        auto gemm = [&](const T& x, const T& w, T& y) {
+            A g; g.t(x).t(w).t(y).i("M", x.t.shape[0]).i("N", w.t.shape[0]).i("K", w.t.shape[1])
+                .s("dtype", "bf16");
+            CHECK_EQ(run("gemm_nt", g), (int)RAD_OK);
+        };
+        /* q_b, the absorb, the selecting attention, the expansion under the gate: rows [r0, r0 + m)
+         * at heads [h0, h0 + h). Returns the gated plane [m, h * vd]. */
+        auto gated = [&](int64_t r0, int64_t m, int64_t h0, int64_t h) {
+            const T qa_ = cut(qa, r0, m, 0, QL), x_ = cut(xin, r0, m, 0, E);
+            const T sel_ = cut(sel, r0, m, 0, P), len_ = cut(len, r0, m, 0, 1);
+            const T wqn_ = cut(wqn, h0 * kd, h * kd, 0, QL), wqr_ = cut(wqr, h0 * R, h * R, 0, QL);
+            const T wg_ = cut(wg, h0 * vd, h * vd, 0, E), wkv_ = cut(wkv, h0 * KV, h * KV, 0, L);
+            const T sk_ = cut(sinks, h0, h, 0, 1);
+            T qn(RAD_BF16, { m, h * kd }), qr(RAD_BF16, { m, h * R }), g(RAD_BF16, { m, h * vd });
+            T ql(RAD_BF16, { m, h * L }), lat(RAD_BF16, { m, h * L }), ag(RAD_BF16, { m, h * vd });
+            gemm(qa_, wqn_, qn); gemm(qa_, wqr_, qr); gemm(x_, wg_, g);
+            A ab; ab.t(qn).t(wkv_).t(ql).i("M", m).i("heads", h).i("k_dim", kd).i("v_dim", vd)
+                .i("latent_dim", L).s("mode", "absorb").s("dtype", "bf16");
+            CHECK_EQ(run("mla_project_kv", ab), (int)RAD_OK);
+            A at; at.t(ql).t(qr).t(cache).t(sel_).t(len_).t(sk_).t(lat).i("M", m).i("heads", h)
+                .i("latent_dim", L).i("rope_dim", R).i("blocks", P).i("block_size", bs)
+                .d("scale", scale).s("dtype", "bf16");
+            CHECK_EQ(run("mla_attn_sel_sink", at), (int)RAD_OK);
+            A ex; ex.t(lat).t(wkv_).t(g).t(ag).i("M", m).i("heads", h).i("k_dim", kd).i("v_dim", vd)
+                .i("latent_dim", L).s("dtype", "bf16");
+            CHECK_EQ(run("mla_expand_gate", ex), (int)RAD_OK);
+            return ag;
+        };
+        auto o_part = [&](const T& ag_cols, int j) {   /* o_proj over rank j's columns */
+            T y(RAD_BF16, { ag_cols.t.shape[0], E });
+            gemm(ag_cols, cut(wo, 0, E, j * Wv, Wv), y);
+            return y;
+        };
+
+        /* The head form: rank r its heads over every row, then the exact all-reduce. */
+        std::vector<T> part;
+        for (int r = 0; r < world; ++r) part.push_back(o_part(gated(0, Tn, r * H, H), r));
+        const T head = reduced(part, Tn, E);
+
+        /* The row form: rank r its rows over every head, the fold, then the gather. */
+        std::vector<T> run_o, whole;
+        for (int r = 0; r < world; ++r) {
+            const T ag = gated(r * n, n, 0, HW);
+            std::vector<T> ps;
+            for (int j = 0; j < world; ++j) ps.push_back(o_part(cut(ag, 0, n, j * Wv, Wv), j));
+            run_o.push_back(folded(ps, n, E));
+            whole.emplace_back(RAD_BF16, std::vector<int64_t>{ Tn, E });
+        }
+        std::vector<A> ga((size_t)world);
+        for (int r = 0; r < world; ++r)
+            ga[(size_t)r].t(run_o[(size_t)r]).t(whole[(size_t)r]).i("world_size", world)
+                .i("numel", n * E).s("dtype", "bf16");
+        REQUIRE(collective("all_gather", ga));
+        for (int r = 0; r < world; ++r) CHECK(whole[(size_t)r].mem == head.mem);
+
+        /* The check discriminates: the head form's own partials summed in bf16 (a rounding an
+         * add) are not those bytes. */
+        if (world == 4) {
+            T acc = part[0];
+            for (int j = 1; j < world; ++j) {
+                A ad; ad.t(acc).t(part[(size_t)j]).t(acc).i("M", Tn).i("n", E).s("dtype", "bf16");
+                REQUIRE_EQ(run("add", ad), (int)RAD_OK);
+            }
+            CHECK(acc.mem != head.mem);
+        }
+    }
+}
+
+/* The fold starts from +0 as the all-reduce does: partials that are all -0 sum to +0, where a fold
+ * seeded with the first partial keeps -0 (one bit, and the bytes differ). */
+TEST(the_row_forms_fold_is_the_exact_all_reduce_down_to_the_sign_of_zero) {
+    const std::vector<float> rows[] = {
+        { -0.0f, -0.0f, 1.0f, 3.0e-5f, -2.5f, 65536.0f },
+        { -0.0f, -0.0f, 1.0f / 256, -1.0f, 2.5f, 1.0f },
+        { -0.0f, 0.0f, 1.0f / 512, 1.0f, 1.0e-20f, 1.0f },
+        { -0.0f, -0.0f, 1.0f / 512, 3.0e-5f, -1.0e-20f, -65536.0f },
+    };
+    std::vector<T> part;
+    for (const auto& r : rows) part.push_back(T(RAD_BF16, { 1, 6 }).f(r));
+    const T want = reduced(part, 1, 6);
+    CHECK(folded(part, 1, 6).mem == want.mem);
+    CHECK(folded(part, 1, 6, true).mem != want.mem);
+    CHECK_EQ(want.mem[1], (uint8_t)0x00);   /* the all -0 column is +0 */
 }
 
 /* ================================================================== the indexer */

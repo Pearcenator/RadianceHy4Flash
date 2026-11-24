@@ -124,6 +124,9 @@ RadEncoding enc_trellis(uint32_t codes, bool colf, uint32_t run = 128) {
 /* G-3's launch fusions are declared only by the tests that ask (g3_fusions); every other test keeps
  * the unfused chains its assertions count. */
 bool g3_fusions = false;
+/* `tp-attn-split: rows` (RadBuildCtx::tp_attn_rows) for the next Declared. */
+bool attn_rows = false;
+int64_t decl_max_tok = 0;   /* and its max_tok, where a test steps more than build_ctx's 256 rows */
 struct G3Env {
     std::vector<const char*> set;
     G3Env() {
@@ -146,6 +149,8 @@ struct Declared {
         : mk(mini_meta(wide, ff_exp, 128, latent, top_k, n_exp)) {
         encs(&b);
         ctx = build_ctx(rank, world);
+        ctx.tp_attn_rows = attn_rows;
+        if (decl_max_tok) ctx.max_tok = decl_max_tok;
         G3Env g3env;
         std::string err;
         err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
@@ -1425,6 +1430,186 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
         }
 }
 
+/* `tp-attn-split: rows` (hyv4flash_attn.h, "The row form"): a sparse layer's selecting prefill step
+ * of 256 rows or more runs its attention by rows at more than one rank. Each rank launches the
+ * model's whole head count over its run of T / world rows, o_proj is one GEMM a rank's columns of
+ * attn_output folded in f32 from +0, an all_gather of whole rows stands where the layer's
+ * all-reduce stood, and the junction behind it does not reduce again. Every other step, the
+ * sliding layer, and a graph with the switch off or a tap on keep the head split. */
+TEST(the_sparse_attention_splits_a_prefill_steps_rows_over_the_ranks) {
+    RadArchProbe pr{};
+    MetaKV pm = mini_meta(true);
+    REQUIRE_EQ(hyv4flash::probe(pm.meta(), &pr), RAD_OK);
+    CHECK_EQ(pr.tp_attn_rows_ok, 1);
+
+    const int64_t M = 2 * rad::arch::GlmTp::kSplitRows, E = 128;
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank)
+            for (int mode = 0; mode < 3; ++mode) {   /* rows; the default; rows under a tap */
+                attn_rows = mode != 1;
+                decl_max_tok = M;
+                if (mode == 2) setenv("RADIANCE_HY4_TAPS", "1", 1);
+                Declared d(bf16_encs, world, rank, true);
+                unsetenv("RADIANCE_HY4_TAPS");
+                attn_rows = false;
+                decl_max_tok = 0;
+                REQUIRE_EQ(d.rc, RAD_OK);
+                RadBuilder& b = d.b;
+                const bool on = mode == 0 && world > 1;
+                const int64_t HW = 4, W = HW / world * 32;
+                const auto& layers = hyv4flash::models[rank]->layers;
+                bool noted = false;
+                for (const auto& s : b.notes) noted |= s.find("tp-attn-split rows") != std::string::npos;
+                CHECK_EQ(noted, on);
+                int gathers = 0;   /* one a sparse layer, into the plane its all-reduce sums */
+                for (const auto& o : b.ops)
+                    gathers += o.op == "all_gather" && in(o.writes, buf_named(b, "sparse.o_proj"));
+                CHECK_EQ(gathers, on ? 2 : 0);
+                for (const auto& l : layers) {
+                    CHECK_EQ(l.attn.op_r_gather != 0, on && !l.sliding);
+                    if (!l.attn.op_r_gather) continue;
+                    CHECK(l.attn.rows_weight_bytes > 0);
+                    CHECK_EQ(l.attn.rout.size(), (size_t)world);
+                    const RecOp& sink = b.ops.at(l.attn.op_r_sel - 1);
+                    CHECK_EQ(pint(&sink, "heads"), HW);
+                    CHECK_EQ(pint(&sink, "stable"), pint(&b.ops.at(l.attn.op_sel_pf - 1), "stable"));
+                    /* Whole views of the head form's stored weights, and attn_output a rank's
+                     * columns at a time: nothing new is read from the container. */
+                    for (rad_weight w : sink.w) CHECK(b.weights.at(w - 1).d.source != nullptr);
+                    for (int j = 0; j < world; ++j) {
+                        const RecWeight& w = b.weights.at(l.attn.rout[(size_t)j].w - 1);
+                        CHECK_EQ(w.d.shape[0], E);
+                        CHECK_EQ(w.d.shape[1], W);
+                        CHECK_EQ(w.span_lo, j * W);
+                        CHECK_EQ(w.span_hi, (j + 1) * W);
+                    }
+                }
+                auto height = [&](const std::vector<std::unique_ptr<RadCtx>>& v, rad_op op) {
+                    int64_t h = 0;
+                    for (const auto& c : v)
+                        for (const auto& is : c->issues) h += op && is.op == op ? is.n : 0;
+                    return h;
+                };
+                auto times = [&](const std::vector<std::unique_ptr<RadCtx>>& v, rad_op op) {
+                    int t = 0;
+                    for (const auto& c : v)
+                        for (const auto& is : c->issues) t += op && is.op == op;
+                    return t;
+                };
+                /* 256 rows: the floor at two ranks; at four, runs of 64 the narrow int8 GEMM
+                 * would take, so heads. */
+                struct Case { std::vector<int> dq, pq; bool rows; };
+                const Case cases[] = {
+                    { {}, { (int)M }, true },            /* a whole prefill chunk */
+                    { {}, { (int)M / 2, (int)M / 2 }, true },   /* two sequences */
+                    { {}, { (int)M / 2 }, world == 2 },
+                    { {}, { 40 }, false },               /* under the floor */
+                    { {}, { (int)M - 2 }, world == 2 },  /* not whole runs at four ranks */
+                    { { 1, 1, 1, 1 }, { (int)M - 4 }, false },   /* decode rows beside it */
+                    { { 1, 1 }, {}, false },             /* decode */
+                };
+                for (const Case& cs : cases) {
+                    auto k = kit(b, cs.dq, cs.pq, 0);
+                    k->b.positions_h = k->pos.data();
+                    auto v = run_passes(b, hyv4flash::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                    const bool rows = on && cs.rows;
+                    int T = 0;
+                    for (int x : cs.pq) T += x;
+                    const int64_t n = T / world;
+                    for (const auto& l : layers) {
+                        if (l.sliding) continue;
+                        const auto& a = l.attn;
+                        CHECK_EQ(height(v, a.op_r_sel), rows ? n : 0);
+                        CHECK_EQ(height(v, a.op_r_absorb), rows ? n : 0);
+                        CHECK_EQ(height(v, a.op_r_gather), rows ? n * E : 0);
+                        CHECK_EQ(times(v, a.op_r_add), rows ? world : 0);
+                        CHECK_EQ(times(v, a.op_r_fill), rows ? 1 : 0);
+                        CHECK_EQ(times(v, a.op_r_narrow), rows ? 1 : 0);
+                        if (!rows) continue;
+                        /* The row form stands in for the head form's launches and its reduction:
+                         * no head-split attention and no all-reduce of o_proj on this step. */
+                        CHECK_EQ(height(v, a.op_sel), 0);
+                        CHECK_EQ(height(v, a.op_sel_pf), 0);
+                        CHECK_EQ(times(v, a.op_ar), 0);
+                        const rad_buf o = a.w.o;
+                        for (const auto& c : v)
+                            for (const auto& is : c->issues) {
+                                const RecOp& op = b.ops.at(is.op - 1);
+                                if (op.op == "all_reduce") CHECK(!in(op.reads, o));
+                                /* This rank's run of the selection, and the gather's whole rows. */
+                                if (is.op == a.op_r_sel) {
+                                    CHECK_EQ(is.opd.at(3).offset, rank * n * 4);   /* group_topk 4 */
+                                    CHECK_EQ(is.opd.at(4).offset, rank * n);
+                                }
+                                if (is.op == a.op_r_gather) CHECK_EQ(is.opd.at(1).rows, T);
+                            }
+                    }
+                }
+            }
+}
+
+/* With the pipelined prefill (RADIANCE_HY4_PIPE) the row form's gather rides the second lane, where
+ * that step's reductions ride: every collective of a step is on one lane (abi/rad_runtime.h), and
+ * the mid junction's two pieces run without a reduction of the attention's output. */
+TEST(the_row_forms_gather_rides_the_pipelines_lane) {
+    setenv("RADIANCE_HY4_PIPE", "1", 1);
+    setenv("RADIANCE_HY4_PIPE_MIN", "64", 1);
+    for (int rank = 0; rank < 4; ++rank) {
+        attn_rows = true;
+        decl_max_tok = 512;
+        Declared d(bf16_encs, 4, rank, true);
+        attn_rows = false;
+        decl_max_tok = 0;
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        auto k = kit(b, {}, { 512 }, 0);
+        k->b.positions_h = k->pos.data();
+        auto v = run_passes(b, hyv4flash::step, { k.get() }, rank, 4);
+        CHECK_PASSES(b, v);
+        const rad_buf o = buf_named(b, "sparse.o_proj"), ro = buf_named(b, "sparse.rows.o_proj");
+        CHECK(in(b.concurrent, ro));
+        int gathers = 0, reductions = 0;
+        for (const auto& c : v)
+            for (const auto& is : c->issues) {
+                const RecOp& op = b.ops.at(is.op - 1);
+                if (op.op != "all_gather" && op.op != "all_reduce") continue;
+                CHECK_EQ(is.lane, 1);
+                gathers += op.op == "all_gather" && in(op.writes, o);
+                reductions += op.op == "all_reduce";
+                if (op.op == "all_reduce") CHECK(!in(op.reads, o));
+            }
+        CHECK_EQ(gathers, 2);       /* the two sparse layers */
+        CHECK(reductions > 0);      /* the pipeline's own pieces */
+    }
+    unsetenv("RADIANCE_HY4_PIPE");
+    unsetenv("RADIANCE_HY4_PIPE_MIN");
+}
+
+/* The row form's ops are declared at every step size, so the arena's smaller levels re-declare
+ * the same op list (a_sizing_declare_at_four_ranks_...). */
+TEST(a_sizing_declare_matches_with_the_attention_by_rows) {
+    for (int world : { 2, 4 }) {
+        attn_rows = true;
+        Declared d(bf16_encs, world, 0, true);
+        attn_rows = false;
+        REQUIRE_EQ(d.rc, RAD_OK);
+        for (int64_t mt : { (int64_t)64, (int64_t)512, (int64_t)2048 }) {
+            RadBuilder pb;
+            bf16_encs(&pb);
+            RadBuildCtx pc = build_ctx(0, world);
+            pc.max_tok = mt;
+            pc.shape_probe = 1;
+            pc.tp_attn_rows = 1;
+            G3Env g3env;
+            REQUIRE_EQ(hyv4flash::declare(&pb, d.mk.meta(), &pc), RAD_OK);
+            REQUIRE_EQ(pb.ops.size(), d.b.ops.size());
+            for (size_t k = 0; k < pb.ops.size(); ++k) CHECK_EQ(pb.ops[k].op, d.b.ops[k].op);
+            for (size_t k = 0; k < pb.bufs.size(); ++k) CHECK_EQ(pb.bufs[k].name, d.b.bufs[k].name);
+        }
+    }
+}
+
 /* The taps the harness compares are the replicated values at every world; a rank's partial sums
  * (the gate logits of its heads, the arms' outputs) are tapped at one rank only, o_proj after its
  * reduction. */
@@ -1634,6 +1819,135 @@ void int8_trunk_encs_host(RadBuilder* b) {
     int8_trunk_encs(b);
     for (const char* op : { "gated_had_quant_i8g", "rmsnorm_had_quant_i8g", "router_sigmoid_topk_scatter" })
         b->undeclared.insert(op);
+}
+
+/* The row form over a quantised gate (hyv4flash_attn.h, "The row form"): its whole-width gate is a
+ * view of the stored int8 weight, codes and scales both, reading the codes q_a's quantiser wrote
+ * as the head form's gate does, so the row step quantises the layer's input once. */
+TEST(the_row_forms_gate_views_the_stored_int8_weight_and_reads_q_as_codes) {
+    for (int rank = 0; rank < 2; ++rank) {
+        /* int8_trunk_encs' attention pair alone: mini's MoE arms are not whole scale groups a rank. */
+        auto encs = [](RadBuilder* b) {
+            bf16_encs(b);
+            b->encs.insert(b->encs.begin(), { { "attn_q_a.", enc_trellis(RAD_U5, true) },
+                                              { "attn_gate.", enc_i8(true) } });
+        };
+        attn_rows = true;
+        Declared d(encs, 2, rank, true);
+        attn_rows = false;
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        int sparse = 0;
+        for (const auto& l : hyv4flash::models[rank]->layers) {
+            if (l.sliding) continue;
+            ++sparse;
+            const auto& g = l.attn.rgate;
+            REQUIRE(g.op != 0);
+            CHECK(g.fed);   /* no quantiser of its own */
+            const RecOp& op = b.ops.at(g.op - 1);
+            const RecOp& head = b.ops.at(l.attn.gate.op - 1);
+            CHECK_EQ(op.op, head.op);
+            CHECK_EQ(pint(&op, "N"), 2 * pint(&head, "N"));
+            REQUIRE_EQ(op.w.size(), head.w.size());
+            for (size_t i = 0; i < op.w.size(); ++i) {
+                const RecWeight &rw = b.weights.at(op.w[i] - 1), &hw = b.weights.at(head.w[i] - 1);
+                CHECK_EQ(rw.d.shard, (int)RAD_SHARD_NONE);
+                REQUIRE(rw.d.source != nullptr);
+                /* The head form's stored weight, plane for plane. */
+                CHECK_EQ(std::string(rw.d.source),
+                         std::string(hw.d.source ? hw.d.source : hw.name.c_str()));
+                CHECK_EQ(std::string(rw.d.planes ? rw.d.planes : ""),
+                         std::string(hw.d.planes ? hw.d.planes : ""));
+            }
+        }
+        CHECK_EQ(sparse, 2);
+        auto k = kit(b, {}, { 256 }, 0);
+        k->b.positions_h = k->pos.data();
+        auto v = run_passes(b, hyv4flash::step, { k.get() }, rank, 2);
+        CHECK_PASSES(b, v);
+    }
+}
+
+/* The same with every linear of the attention quantised, on a mini wide enough for whole scale
+ * groups a rank (eight sparse heads, a 128-wide q residual): q_nope, q_rope and the gate are whole
+ * views of the stored int8 weights, and attn_output's two column shares are views of its codes and
+ * scales over their own 128-column groups, each with the head form's K. */
+TEST(the_row_form_views_quantised_q_b_and_output_weights) {
+    /* Both ranks, G-3's launch fusions off and on, and q_b and the gate as rotated int8 or as the
+     * u5 trellis of hy4-flash-iqr-gptq.recipe (attn_output rotated int8 in both). */
+    for (int rank = 0; rank < 8; ++rank) {
+        g3_fusions = (rank & 2) != 0;
+        const bool tcq = rank >= 4;
+        struct Off { ~Off() { g3_fusions = false; } } off;
+        MetaKV mk = mini_meta(true);
+        mk.m.n_head = mk.m.n_head_kv = 8;
+        mk.set("num_attention_heads", "8").set("q_lora_rank", "128");
+        RadBuilder b;
+        bf16_encs(&b);
+        const RadEncoding qe = tcq ? enc_trellis(RAD_U5, true, 16) : enc_i8(true);
+        b.encs.insert(b.encs.begin(), { { "attn_q_nope", qe },
+                                        { "attn_q_rope", qe },
+                                        { "attn_gate.", qe },
+                                        { "attn_output", enc_i8(true) } });
+        RadBuildCtx ctx = build_ctx(rank % 2, 2);
+        ctx.tp_attn_rows = 1;
+        G3Env g3env;
+        int rc = 0;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+        REQUIRE_EQ(rc, RAD_OK);
+        int sparse = 0;
+        for (const auto& l : hyv4flash::models[rank % 2]->layers) {
+            if (l.sliding) continue;
+            ++sparse;
+            const auto& a = l.attn;
+            REQUIRE(a.op_r_gather != 0);
+            struct Pair { const hyv4flash::Lin* rows; const hyv4flash::Lin* head; int64_t n; };
+            const Pair whole[] = { { &a.rq_nope, &a.q_nope, 8 * 24 }, { &a.rq_rope, &a.q_rope, 8 * 8 },
+                                   { &a.rgate, &a.gate, 8 * 32 } };
+            for (const Pair& p : whole) {
+                REQUIRE(p.rows->op != 0);
+                const RecOp &op = b.ops.at(p.rows->op - 1), &head = b.ops.at(p.head->op - 1);
+                CHECK_EQ(op.op, head.op);
+                CHECK_EQ(pint(&op, "N"), p.n);
+                CHECK_EQ(pint(&head, "N"), p.n / 2);
+                CHECK_EQ(pint(&op, "K"), pint(&head, "K"));
+                REQUIRE_EQ(op.w.size(), head.w.size());
+                for (size_t i = 0; i < op.w.size(); ++i) {
+                    const RecWeight &rw = b.weights.at(op.w[i] - 1), &hw = b.weights.at(head.w[i] - 1);
+                    CHECK_EQ(rw.d.shard, (int)RAD_SHARD_NONE);
+                    REQUIRE(rw.d.source != nullptr);
+                    CHECK_EQ(std::string(rw.d.source),
+                             std::string(hw.d.source ? hw.d.source : hw.name.c_str()));
+                }
+            }
+            const RecOp& ho = b.ops.at(a.out.op - 1);
+            REQUIRE_EQ(a.rout.size(), (size_t)2);
+            for (int j = 0; j < 2; ++j) {
+                const RecOp& op = b.ops.at(a.rout[(size_t)j].op - 1);
+                CHECK_EQ(op.op, ho.op);
+                CHECK_EQ(pint(&op, "K"), pint(&ho, "K"));   /* the head form's GEMM but for M */
+                CHECK_EQ(pint(&op, "N"), pint(&ho, "N"));
+                REQUIRE_EQ(op.w.size(), ho.w.size());
+                for (rad_weight w : op.w) {
+                    const RecWeight& rw = b.weights.at(w - 1);
+                    REQUIRE(rw.d.source != nullptr);
+                    CHECK_EQ(std::string(rw.d.source), std::string("blk.") +
+                                                           std::to_string(l.attn.layer) +
+                                                           ".attn_output.weight");
+                    CHECK(rw.span_set);
+                    CHECK_EQ(rw.span_hi - rw.span_lo, rw.d.shape[rw.d.rank - 1]);
+                }
+            }
+        }
+        CHECK_EQ(sparse, 2);
+        for (int rows : { 256, 40 }) {   /* by rows, and the head form of the same graph */
+            auto k = kit(b, {}, { rows }, 0);
+            k->b.positions_h = k->pos.data();
+            auto v = run_passes(b, hyv4flash::step, { k.get() }, rank % 2, 2);
+            CHECK_PASSES(b, v);
+        }
+    }
 }
 
 /* K-19: the gather writes the routed sum's rotated int8 codes and scales in the launch that sums

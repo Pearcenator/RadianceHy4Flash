@@ -2058,8 +2058,9 @@ step's rows with every head, and an `all_gather` of the runs replaces the all-re
 attention dominates a prefill that is faster, but every card then holds the attention's projections
 at full width, and the result is not bit-identical to the default `heads` split. Only a plugin that
 declares the row split takes it (GLM-5.3: +18 to 21 % prefill at eight ranks for 1.29 GiB a card, a
-mean KL of 0.038 against `heads`, docs/ARCHITECTURES.md); elsewhere, and at `tp: 1`, the key stops
-the start by name.
+mean KL of 0.038 against `heads`, docs/ARCHITECTURES.md; Hy4-flash: its sparse layers' selecting
+prefill steps, built to write the head split's bytes, docs/ARCHITECTURES.md "The sparse attention by
+rows"); elsewhere, and at `tp: 1`, the key stops the start by name.
 
 At three and four ranks `wht6` selects tiered int8 over a two-shot all-reduce, both hops quantised
 (at three ranks the shards are whole 32-element groups, one uneven where the message does not

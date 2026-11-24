@@ -824,7 +824,8 @@ struct Config {
      * PCIe. The received sum then differs undetectably, hence a named flag, not a heuristic. */
     int   tp_wire_exact = 1;          /* --tp-wire exact|wht6 */
     /* --tp-attn-split heads|rows: 1 runs a prefill-sized step's attention by rows over the ranks
-     * (RadBuildCtx::tp_attn_rows). Not bit-identical to the head split, so heads is the default. */
+     * (RadBuildCtx::tp_attn_rows). GLM's is not bit-identical to the head split, so heads is the
+     * default. */
     int   tp_attn_rows = 0;
     /* --weight-prefetch on|off: off declares none of the plugin's weight reads beside the
      * collectives (RadBuildCtx::weight_prefetch_off), for an engine that shares its cards with
