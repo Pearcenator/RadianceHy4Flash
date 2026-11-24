@@ -1335,6 +1335,51 @@ TEST(taps_at_more_ranks_are_the_replicated_values) {
     steps_clean_at(d.b, 1, 2);
 }
 
+/* The indexer's row split (hyv4flash_indexer.h, GLM's DsaCache split): at two and four ranks a
+ * selecting step of GlmTp::kSplitRows query rows scores and selects only this rank's run (runs of
+ * four-row multiples) and gathers the table, counts and lengths, in place of the whole step's
+ * select; lint clean on every rank. RADIANCE_HY4_IX_SPLIT=0 and one rank keep the whole step. (The
+ * gathered bytes equal the replicated ones: r4d_emu_hy4's idx_split.) */
+TEST(the_indexer_splits_a_prefill_steps_rows_over_the_ranks) {
+    for (int off = 0; off < 2; ++off)
+        for (int world : { 1, 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                if (off) setenv("RADIANCE_HY4_IX_SPLIT", "0", 1);
+                Declared d(bf16_encs, world, rank, true);
+                unsetenv("RADIANCE_HY4_IX_SPLIT");
+                REQUIRE_EQ(d.rc, RAD_OK);
+                const bool split = !off && world > 1;
+                const int64_t M = rad::arch::GlmTp::kSplitRows,
+                              R = split ? rad::arch::GlmTp::run_rows(M, world, 4) : 0;
+                if (split) CHECK_EQ(R % 4, 0);
+                auto k = kit(d.b, {}, { (int)M }, 0);
+                k->b.positions_h = k->pos.data();
+                auto v = run_passes(d.b, hyv4flash::step, { k.get() }, rank, world);
+                CHECK_PASSES(d.b, v);
+                int selecting = 0;
+                for (const auto& l : hyv4flash::models[0]->layers) {
+                    if (!l.ix.op_select) continue;
+                    CHECK_EQ(l.ix.op_score_part != 0, split);
+                    auto height = [&](rad_op op) {
+                        int64_t n = 0;
+                        for (const auto& c : v)
+                            for (const auto& is : c->issues) n += op && is.op == op ? is.n : 0;
+                        return n;
+                    };
+                    const int64_t whole = height(l.ix.op_select), part = height(l.ix.op_score_part);
+                    if (!whole && !part) continue;   /* a layer that did not select */
+                    ++selecting;
+                    CHECK_EQ(whole, split ? 0 : M);
+                    CHECK_EQ(part, R);
+                    CHECK_EQ(height(l.ix.op_select_part), R);
+                    CHECK_EQ(height(l.ix.op_gather_nsel), R);
+                    CHECK_EQ(height(l.ix.op_gather_len), R);
+                    CHECK_EQ(height(l.ix.op_gather_sel), R * 4);   /* mini's group_topk */
+                }
+                CHECK(selecting > 0);
+            }
+}
+
 /* What does not split is refused by name at declare: a world other than 1, 2 or 4, heads that are
  * not whole a rank (mini's two sparse heads over four), quantised experts whose width is not whole
  * 128-column groups a rank (mini's 128 at two), and a library without an exact all-reduce. */
