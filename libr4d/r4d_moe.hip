@@ -2260,9 +2260,9 @@ constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots 
 constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
 static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
 
-template <uint32_t NW, bool Q = false>
+template <uint32_t NW, bool Q = false, bool F32 = false>
 __device__ __forceinline__ void gather_wide_body(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
@@ -2281,13 +2281,16 @@ __device__ __forceinline__ void gather_wide_body(
      * any lane. */
     const uint32_t jl = lane < top_k ? lane : 0u;
     const int32_t  il = inv[(size_t)t * top_k + jl];
-    const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
+    /* bf16 weights widen to f32 below; f32 ones (K-45, Hy4's) are the lane value's bits as read. */
+    const int32_t  wl = F32 ? ((const int32_t*)ew)[(size_t)t * ew_ld + jl]
+                            : (int32_t)((const uint16_t*)ew)[(size_t)t * ew_ld + jl];
     int32_t si[kGatherWideSlots];
     float   sw[kGatherWideSlots];
 #pragma unroll
     for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
         si[j] = __builtin_amdgcn_readlane(il, (int)j);
-        sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
+        const int32_t wj = __builtin_amdgcn_readlane(wl, (int)j);
+        sw[j] = F32 ? __int_as_float(wj) : bf16_to_f32((uint16_t)wj);
     }
     if (c >= n) return;
     /* No break or continue in these loops: an early exit keeps the slot loop rolled and `yv` goes
@@ -2320,8 +2323,11 @@ __device__ __forceinline__ void gather_wide_body(
             const uint32_t d[4] = { yv[j].x, yv[j].y, yv[j].z, yv[j].w };
 #pragma unroll
             for (uint32_t q = 0; q < 4; ++q) {
-                acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
-                acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                /* gather_kernel's multiply-add for the weight's dtype: fmaf for f32 (the F32 law). */
+                acc[2 * q]     = r4d_moegather::gather_mac<F32>(
+                    wj, bf16_to_f32((uint16_t)(d[q] & 0xFFFFu)), acc[2 * q]);
+                acc[2 * q + 1] = r4d_moegather::gather_mac<F32>(
+                    wj, bf16_to_f32((uint16_t)(d[q] >> 16)), acc[2 * q + 1]);
             }
         }
     }
@@ -2351,15 +2357,15 @@ __device__ __forceinline__ void gather_wide_body(
 /* `Q` adds the sum's rotated int8 codes and their scales (moe_gather_inv_i8g, K-19) to the same
  * sums and store, so one kernel and one argument list serve both forms (moe_gather_body's wide
  * branch); the codes' operands are unused and may be null without it. */
-template <uint32_t NW, bool Q = false>
+template <uint32_t NW, bool Q = false, bool F32 = false>
 __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
     uint32_t sh_ld, uint32_t sg_ld, int sig, uint8_t* __restrict__ q8, float* __restrict__ s8,
     uint32_t q_ld, uint32_t s_ld, uint32_t g8) {
-    gather_wide_body<NW, Q>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sh, sg, sh_ld, sg_ld,
+    gather_wide_body<NW, Q, F32>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sh, sg, sh_ld, sg_ld,
                             sig, q8, s8, q_ld, s_ld, g8);
 }
 
@@ -3530,7 +3536,7 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant
     auto al16 = [](const void* p, long long ld) {
         return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
     };
-    const bool wide_ok = ew->dtype == RAD_BF16 && !small && top_k <= (long long)kGatherWideSlots &&
+    const bool wide_ok = !small && top_k <= (long long)kGatherWideSlots &&
                          n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
     /* The sixteen-slot form (gather_kernel16, eight columns a lane, one sixteen-byte load a slot):
@@ -3553,15 +3559,21 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant
         float*   const sp = quant ? (float*)s8->data : nullptr;
 #define R4D_MGW(...)                                                                             \
         hipLaunchKernelGGL((__VA_ARGS__), grid, blk, 0, (hipStream_t)s,                          \
-                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,            \
+                           (const uint16_t*)ye->data, (const void*)ew->data, inv,                \
                            (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,        \
                            (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,                     \
                            sh ? (const uint16_t*)sh->data : nullptr,                             \
                            sh ? (const uint16_t*)sg->data : nullptr,                             \
                            (uint32_t)sh_ld, (uint32_t)sg_ld, sig, qp, sp,                        \
                            (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)g8)
-        if (quant) { R4D_MGW(gather_wide_kernel<NW, true>); }
-        else       { R4D_MGW(gather_wide_kernel<NW>); }
+        const bool f32w = ew->dtype == RAD_F32;
+        if (quant) {
+            if (f32w) { R4D_MGW(gather_wide_kernel<NW, true, true>); }
+            else      { R4D_MGW(gather_wide_kernel<NW, true>); }
+        } else {
+            if (f32w) { R4D_MGW(gather_wide_kernel<NW, false, true>); }
+            else      { R4D_MGW(gather_wide_kernel<NW>); }
+        }
 #undef R4D_MGW
         R4D_MOE_CHK();
         return RAD_OK;

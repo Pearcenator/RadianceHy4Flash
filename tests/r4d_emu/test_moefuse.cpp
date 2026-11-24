@@ -17,8 +17,8 @@
  *
  * moe_gather_inv_i8g through its published entry point (libr4d/r4d_moe.hip), which is where the
  * wave form is chosen and where its refusals live: the sixteen-slot quantising kernel at a decode
- * height, the wide (256-column-wave) one at prefill with bf16 routing weights (and each pinned),
- * the kernel that ran named, the sums against the plain sixteen-slot form's launch and the codes
+ * height, the wide (256-column-wave) one at prefill with bf16 or f32 routing weights (and each pinned),
+ * the kernel that ran named (f32 routing weights, K-45, as well as bf16), the sums against the plain sixteen-slot form's launch and the codes
  * and scales the quantiser's arithmetic applied to the sums the op itself wrote -- the pair the
  * fusion replaces -- then every refusal of its quantising block. */
 #include "rad_abi.h"
@@ -762,6 +762,8 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
         { 48, 512, 256, 0, false, true },
         { 48, 2560, 128, 3, false, false },   /* the sixteen-slot form, pinned at prefill */
         { 48, 512, 128, 2, false, true },     /* the wide form, pinned */
+        { 48, 2560, 128, 0, true, true },     /* prefill, f32 weights (Hy4's): the wide form (K-45) */
+        { 48, 512, 256, 2, true, true },      /* ... pinned, a 256-wide scale group */
     };
     const int k = 16, ne = 288;
     const float s_poison = -1234.5f;
@@ -906,7 +908,6 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
         { "a scale group of 64", 2, 512, 64, 16, 0, RAD_E_UNSUPPORTED, false, false, false },
         { "top_k 8 (the op's band is 16)", 2, 512, 128, 8, 0, RAD_E_UNSUPPORTED, false, false, false },
         { "the scalar form, pinned", 48, 512, 128, 16, 1, RAD_E_UNSUPPORTED, false, false, false },
-        { "the wide form with f32 routing weights", 48, 512, 128, 16, 2, RAD_E_UNSUPPORTED, false, false, true },
         { "no codes operand", 2, 512, 128, 16, 0, RAD_E_INVAL, true, false, false },
         { "int8 scales", 2, 512, 128, 16, 0, RAD_E_DTYPE, false, true, false },
     };
@@ -945,6 +946,118 @@ void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* moe_gather_inv through the published op at prefill (K-45): the wide kernel serves f32 routing
+ * weights as it does bf16 ones, and every shape's bytes are the scalar form's (pin 1), the form
+ * that served f32 weights past the self-scan bound before. Shared arm absent, ungated and
+ * sigmoid-gated; a slice that drops slots; an f32 row pitch wider than top_k. */
+void gather_wide_f32_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct WShape {
+        int M, n, nl, base, ew_ld;
+        bool f32w;
+        const char* shared; /* nullptr none, "none" ungated, "sigmoid" gated */
+    };
+    const WShape shapes[] = {
+        { 48, 2560, 288, 0, 16, true, nullptr },
+        { 48, 2560, 288, 0, 16, true, "none" },
+        { 48, 2560, 288, 0, 16, true, "sigmoid" },
+        { 48, 512, 288, 0, 20, true, nullptr },       /* a padded weights row */
+        { 48, 2560, 144, 0, 16, true, "none" },       /* a slice: half the slots drop */
+        { 48, 2560, 288, 0, 16, false, "sigmoid" },   /* bf16 weights, as before */
+    };
+    const int k = 16;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto mat = [](void* d, uint32_t dt, int64_t r, int64_t c, int64_t ld) {
+        RadTensor t{};
+        t.data = d;
+        t.dtype = dt;
+        t.rank = 2;
+        t.shape[0] = r;
+        t.shape[1] = c;
+        t.stride[0] = ld;
+        t.stride[1] = 1;
+        return t;
+    };
+    for (const WShape& sh : shapes) {
+        const int M = sh.M, n = sh.n, T = M * k;
+        std::vector<int32_t> ids((size_t)T);
+        for (int r = 0; r < M; ++r) {
+            std::vector<int32_t> pool(288);
+            for (int e = 0; e < 288; ++e) pool[(size_t)e] = e;
+            std::shuffle(pool.begin(), pool.end(), rng);
+            for (int j = 0; j < k; ++j) ids[(size_t)(r * k + j)] = pool[(size_t)j];
+        }
+        Scatter inv = scatter_kernel(ids, sh.nl, sh.base, nullptr, true);
+        std::vector<uint16_t> ye((size_t)T * n), shp((size_t)M * n), sg((size_t)M), y((size_t)M * n),
+            y1((size_t)M * n);
+        std::vector<float> ewf((size_t)M * sh.ew_ld);
+        std::vector<uint16_t> ewb((size_t)M * sh.ew_ld);
+        if (((uintptr_t)ye.data() | (uintptr_t)shp.data() | (uintptr_t)y.data()) % 16 != 0) {
+            std::printf("FAIL moe_gather_inv wide f32: unaligned buffers at M=%d\n", M);
+            ++fails;
+            continue;
+        }
+        for (auto& v : ye) v = f2b(nd(rng));
+        for (auto& v : shp) v = f2b(nd(rng));
+        for (auto& v : sg) v = f2b(nd(rng));
+        for (size_t i = 0; i < ewf.size(); ++i) {
+            ewf[i] = std::fabs(nd(rng)) * 0.3f;
+            ewb[i] = f2b(ewf[i]);
+        }
+        auto run = [&](int pin, std::vector<uint16_t>& out) {
+            std::fill(out.begin(), out.end(), kGatePoison);
+            RadTensor t[6] = { mat(ye.data(), RAD_BF16, T, n, n),
+                               mat(sh.f32w ? (void*)ewf.data() : (void*)ewb.data(),
+                                   sh.f32w ? RAD_F32 : RAD_BF16, M, k, sh.ew_ld),
+                               mat(inv.inv.data(), RAD_I32, T, 1, 1),
+                               mat(shp.data(), RAD_BF16, M, n, n), mat(sg.data(), RAD_BF16, M, 1, 1),
+                               mat(out.data(), RAD_BF16, M, n, n) };
+            t[2].rank = 1;
+            t[2].shape[0] = T;
+            t[2].stride[0] = 1;
+            RadParam p[3] = { pint("n", n), pint("top_k", k), RadParam{} };
+            p[2].key = "act";
+            p[2].kind = RAD_P_STR;
+            p[2].sval = sh.shared ? sh.shared : "none";
+            RadArgs a{};
+            a.t = t;
+            a.n_t = 6;
+            a.p = p;
+            a.n_p = 3;
+            a.world_size = 1;
+            if (!sh.shared) { a.n_t = 6; t[3].data = nullptr; t[4].data = nullptr; }
+            r4d_moe_gather_pin_form(pin);
+            const int rc = r4d_rad_moe_gather_inv(&a, nullptr);
+            r4d_moe_gather_pin_form(0);
+            return rc;
+        };
+        ++cases;
+        if (inv.rc != RAD_OK) {
+            std::printf("FAIL moe_gather_inv wide f32: the inverse at M=%d\n", M);
+            ++fails;
+            continue;
+        }
+        const int rc0 = run(0, y);
+        const bool wide0 = std::strstr(emu_last_kernel, "gather_wide_kernel") != nullptr;
+        const int rc1 = run(1, y1);
+        if (rc0 != RAD_OK || rc1 != RAD_OK || !wide0) {
+            std::printf("FAIL moe_gather_inv wide f32 at M=%d n=%d %s weights: rc %d / %d, rule ran "
+                        "%s, wanted gather_wide_kernel\n", M, n, sh.f32w ? "f32" : "bf16", rc0, rc1,
+                        wide0 ? "gather_wide_kernel" : "another kernel");
+            ++fails;
+            continue;
+        }
+        ++cases;
+        if (y != y1) {
+            size_t first = 0;
+            while (first < y.size() && y[first] == y1[first]) ++first;
+            std::printf("FAIL moe_gather_inv wide at M=%d n=%d %s weights shared %s: differs from "
+                        "the scalar form, first at %zu\n", M, n, sh.f32w ? "f32" : "bf16",
+                        sh.shared ? sh.shared : "none", first);
+            ++fails;
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -955,6 +1068,7 @@ int main() {
     gather_sixteen_cases(rng, cases, fails);
     gather_quant_cases(rng, cases, fails);
     gather_quant_launcher_cases(rng, cases, fails);
+    gather_wide_f32_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }
