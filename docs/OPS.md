@@ -3329,12 +3329,13 @@ with the partial page appended.
   number it already has.
 
 libr4d's kernel takes scratch (sized by the row's scratch hook; it is not an operand). With it, a
-launch of at most 128 query rows (a decode step's verify rows: 16 sequences of `1 + n_spec` = 6
-are 96) cuts the block list into up to 16 chunks, takes each chunk's own top-k and merges them, so
+launch of at most 64 query rows (a decode step's verify rows up to 10 sequences of `1 + n_spec` =
+6) cuts the block list into up to 16 chunks, takes each chunk's own top-k and merges them, so
 a decode step uses more than `1 + n_spec` workgroups. The result is exact,
 because a chunk's local top-k contains every global top-k member of that chunk, and identical in
 output layout too: the attention sums the selected pages in table order and float addition is not
-associative. Without scratch, or above 128 rows, one workgroup per query walks the whole list.
+associative. Without scratch, or above 64 rows, one workgroup per query walks the whole list (above 64, the
+wide kernel, which is faster there than the split).
 
 ### `kv_resolve`
 

@@ -794,10 +794,11 @@ static int g_qsa_select_form = 0;
  * so the tie rule needs no sort. The merge is not split further: its input is already small, and
  * splitting it would need a global prefix (two more kernels and dispatch gaps) for ~4% of the cost.
  *
- * Above kParM query rows the grid is wide enough and the single-workgroup kernel runs. A decode
- * step's verify rows stay under it: 16 sequences of 1 + 5 draft rows are 96, which at 32 took the
- * single-workgroup kernel, one workgroup walking a row's whole history five times (K-25). */
-constexpr int kParM    = 128;     /* query rows the split path serves; a prefill chunk is wider */
+ * Above kParM query rows the grid is wide enough: past kCacheMaxM the wide kernel runs, and it
+ * beats the split path there. kParM meets kCacheMaxM so no launch takes the cached single-workgroup
+ * kernel at length: at 32, 33-64 verify rows (6-10 sequences of 1 + 5 draft rows) took it, one
+ * workgroup walking a row's whole history five times (K-25). */
+constexpr int kParM    = kCacheMaxM;  /* query rows the split path serves; a prefill chunk is wider */
 constexpr int kParWMax = 16;      /* chunks a query, and what the scratch is sized for */
 constexpr int kParCap  = 8192;    /* keys a chunk may stage: 32 KiB, the same budget as above */
 /* Set in a chunk's count when the chunk had more than topk live keys: the merge then knows the
@@ -1158,7 +1159,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
 }  // namespace
 
 /* Split-path scratch, sized from topk alone so declare (parameters only) and issue agree: two
- * candidate planes and a count per (query, chunk) at the fixed kParM x kParWMax stride (8.4 MiB
+ * candidate planes and a count per (query, chunk) at the fixed kParM x kParWMax stride (4.2 MiB
  * at topk 512). */
 static inline int64_t par_scratch_bytes(long long topk) {
     if (topk <= 0) return 0;
