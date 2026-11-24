@@ -270,9 +270,13 @@ public:
         return stream_.view(plan(group), group);
     }
     StreamCost  stream_cost() const { return stream_.cost(plans_, max_ctx_, max_seqs_); }
-    int  alloc_stream(MemAllocator& host_alloc, Pool& kv_pool) {
-        return stream_.alloc(plans_, max_ctx_, max_seqs_, host_alloc, kv_pool);
+    /* `leader`: the rank whose mirror a share_stream() group borrows (kvstream_share). */
+    int  alloc_stream(MemAllocator& host_alloc, Pool& kv_pool, const KVManager* leader = nullptr) {
+        return stream_.alloc(plans_, max_ctx_, max_seqs_, host_alloc, kv_pool,
+                             leader ? &leader->stream_ : nullptr);
     }
+    void share_stream(int32_t group) { stream_.share(group); }
+    bool stream_shared(int32_t group) const { return stream_.shared(group); }
     int  init_stream(RadStream s) { return stream_.init(plans_, s); }
     void free_stream(MemAllocator& host_alloc) { stream_.release(host_alloc); }
     StreamStats stream_stats() const { return stream_.stats(plans_); }

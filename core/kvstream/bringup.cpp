@@ -109,11 +109,31 @@ int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroup
     return RAD_OK;
 }
 
+int kvstream_share(const std::vector<KVManager*>& ranks) {
+    if (ranks.size() < 2 || !ranks[0]) return 0;
+    int n = 0;
+    for (int32_t g = 0; g < ranks[0]->n_groups(); ++g) {
+        const KVGroupPlan* p0 = ranks[0]->plan(g);
+        bool same = p0 != nullptr;
+        for (size_t i = 0; i < ranks.size() && same; ++i) {
+            const KVGroupPlan* p = ranks[i] ? ranks[i]->plan(g) : nullptr;
+            same = p && p->replicated && !p->zero && p->kind == RAD_KV_FULL &&
+                   p->bytes_per_block == p0->bytes_per_block && p->n_layers == p0->n_layers &&
+                   p->block_size == p0->block_size;
+        }
+        if (!same) continue;
+        for (size_t i = 1; i < ranks.size(); ++i) ranks[i]->share_stream(g);
+        ++n;
+    }
+    return n;
+}
+
 void kvstream_host_add(KVStreamHostUse* use, const KVManager& kv) {
     const KVStreamCost c = kv.stream_cost();
     use->sum.groups     += c.groups;
     use->sum.host_bytes += c.host_bytes;
     use->sum.map_bytes  += c.map_bytes;
+    use->sum.shared     += c.shared;
     use->max_rank_bytes = std::max(use->max_rank_bytes, c.host_bytes);
 }
 
@@ -121,6 +141,15 @@ int kvstream_host_gate(const KVStreamHostUse& use, int n_ranks, int64_t still, i
     if (use.sum.host_bytes <= 0) return RAD_OK;
     std::string why;
     if (lockable_room(use.sum.host_bytes, still, headroom, false, &why)) return RAD_OK;
+    if (use.sum.shared > 0 && use.sum.host_bytes == use.max_rank_bytes) {
+        RAD_ERR("kv streaming: the host mirror for %lld streamed KV group(s) needs %s of pinned "
+                "host memory, held once for the %d ranks, and %s. It holds one full context a "
+                "sequence: lower --max-model-len or --max-num-seqs, or set --kv-resident 0 "
+                "(--host-pool-mib sizes the experts' tier, not this one)",
+                (long long)(use.sum.groups - use.sum.shared), humanb(use.sum.host_bytes).c_str(),
+                n_ranks, why.c_str());
+        return RAD_E_NOMEM;
+    }
     RAD_ERR("kv streaming: the host mirror for %lld streamed KV group(s) needs up to %s of "
             "pinned host memory a rank (%s over %d ranks), and %s. It holds one full context a "
             "sequence: lower --max-model-len or --max-num-seqs, or set --kv-resident 0 "
@@ -151,7 +180,13 @@ void kvstream_report(const KVStreamSetup& s, const KVStreamHostUse& host, int n_
                  (long long)(s.raised_tokens / s.block_size), (long long)s.block_size,
                  s.raised_by_union ? "the blocks one decode step can select"
                                    : "the floor below which misses cost more than the ring saves");
-    if (host.sum.groups > 0)
+    if (host.sum.groups > 0 && host.sum.shared > 0 && host.sum.host_bytes == host.max_rank_bytes)
+        RAD_INFO("kv streaming: %lld group(s) stream (%s): %s of pinned host mirror, the same on "
+                 "every rank and held once for the %d, %s of ring maps in the KV pools",
+                 (long long)(host.sum.groups - host.sum.shared), s.group_name.c_str(),
+                 humanb(host.sum.host_bytes).c_str(), n_ranks,
+                 humanb(host.sum.map_bytes).c_str());
+    else if (host.sum.groups > 0)
         RAD_INFO("kv streaming: %lld group(s) stream (%s): up to %s of pinned host mirror a "
                  "rank (%s over %d), %s of ring maps in the KV pools",
                  (long long)host.sum.groups, s.group_name.c_str(),

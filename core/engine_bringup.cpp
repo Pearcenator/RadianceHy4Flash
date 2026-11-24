@@ -4653,6 +4653,12 @@ int Engine::configure_kv() {
      * pinned after them: the prefix cache's, the activation arenas and, when sized already, the
      * checkpoint store. */
     KVStreamHostUse stream_host;
+    {
+        /* A group that is the same on every rank keeps one mirror, the first rank's (X-05b). */
+        std::vector<KVManager*> kvs;
+        for (auto& r : ranks_) kvs.push_back(&r->kv);
+        kvstream_share(kvs);
+    }
     for (auto& r : ranks_) kvstream_host_add(&stream_host, r->kv);
     if (stream_host.sum.host_bytes > 0) {
         const int64_t MiB = (int64_t)1 << 20;
@@ -4680,7 +4686,7 @@ int Engine::configure_kv() {
          * of this rank's KV pool, so the paged split sees them taken. */
         const KVManager::StreamCost sc = r->kv.stream_cost();
         if (sc.groups > 0)
-            RAD_TRY(r->kv.alloc_stream(rad_device_allocator(), r->pools.kv()));
+            RAD_TRY(r->kv.alloc_stream(rad_device_allocator(), r->pools.kv(), &ranks_[0]->kv));
         if (cfg_.kv_reserve > 0)
             r->kv.set_flex(rank_cfg_[(size_t)r->index].vram_kv_mib * ((int64_t)1 << 20));
         RAD_TRY(r->kv.carve(r->pools.kv()));

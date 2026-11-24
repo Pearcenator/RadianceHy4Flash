@@ -33,7 +33,8 @@ struct KVStreamSetup {
 };
 
 /* The host mirrors summed over the ranks; `max_rank_bytes` is the largest one rank pins (an uneven
- * tensor-parallel split gives ranks different shards). */
+ * tensor-parallel split gives ranks different shards). A rank that borrows a group's mirror
+ * (kvstream_share) adds nothing for it, so a shared mirror is counted once. */
 struct KVStreamHostUse {
     KVStreamCost sum;
     int64_t      max_rank_bytes = 0;
@@ -58,6 +59,14 @@ bool kvstream_op_gated(const RadBuildCtx& ctx, const char* op);
  *     --kv-resident itself is left as given; `out` holds both numbers for the report. */
 int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroupInfo>& groups,
                        const Program& prog, KVStreamSetup* out);
+
+/* X-05b: one mirror for a streamed group that is the same on every rank. A group every rank
+ * declares replicated (rad_kv_group_replicated, the claim the host tier's slot layout already
+ * rests on, TierExec::slot_layout), none declares zero, and all hold at one width and depth is
+ * marked shared on every rank but the first, which pins the one mirror the others bind. Call
+ * after every rank's plan_groups() and before kvstream_host_add() and alloc_stream(). Returns the
+ * groups shared; 0 at one rank. */
+int kvstream_share(const std::vector<KVManager*>& ranks);
 
 /* Add one rank's stream_cost() to `use`. */
 void kvstream_host_add(KVStreamHostUse* use, const KVManager& kv);

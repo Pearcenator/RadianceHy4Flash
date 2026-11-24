@@ -598,8 +598,9 @@ int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g);
  * rank computes whole, an indexer's key cache every rank pools into); the engine moves bytes and
  * cannot know. RADIANCE_DEBUG_TIER_VERIFY checks the claim: each follower hashes what it would
  * have written and the leader compares. Paged groups only, and never a group this rank declared
- * zero. No effect at one rank, and none on a group that streams, whose host mirror is its tier.
- * Additive export. */
+ * zero. No effect at one rank. A group that streams has no tier slot (its host mirror is its
+ * tier); declared replicated on every rank, it keeps one mirror for all of them
+ * (docs/KV-STREAMING.md §3.2). Additive export. */
 int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g);
 
 /* The group is read over its whole history every decode step (an indexer's block keys), so it

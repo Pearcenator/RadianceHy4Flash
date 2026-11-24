@@ -210,7 +210,8 @@ void ref_resolve(Fix& f) {
 /* The device entry point over a fixture. Its scratch is the row's `next_pow2(slots)` miss-list ids
  * (the list is sorted there when a launch is too wide for the shared claim list) then `slots`
  * slots. */
-int dev_resolve(Fix& f) {
+/* `host`: another fixture's mirror to read instead of this one's (a mirror the ranks share). */
+int dev_resolve(Fix& f, uint8_t* host = nullptr) {
     int64_t nlist = 1;
     while (nlist < f.slots) nlist <<= 1;
     std::vector<int32_t> scratch((size_t)(nlist + f.slots), 0);
@@ -220,7 +221,7 @@ int dev_resolve(Fix& f) {
                        tens(f.sblk.data(), RAD_I32, { f.slots }),
                        tens(f.sst.data(), RAD_I32, { f.slots, 2 }),
                        tens(f.ctl.data(), RAD_I32, { 16 }),
-                       tens(f.host.data(), RAD_U8, { f.blocks, f.bbytes }),
+                       tens(host ? host : f.host.data(), RAD_U8, { f.blocks, f.bbytes }),
                        tens(f.pool.data(), RAD_U8, { f.slots, f.bbytes }) };
     RadParam p[5]{};
     p[0] = { "M", RAD_P_INT, f.M };
@@ -494,6 +495,51 @@ int run_all() {
         f.sel = { 0, 2, 4, 6, 7 };
         f.nsel = { 5 };
         fails += check("identity for every miss, hand untouched", f);
+    }
+    ++cases;
+    {
+        /* X-05b: two ranks whose rings hold different blocks resolve the same selections out of
+         * one mirror, the first rank's, call after call. Each rank's selection, maps and ring are
+         * what libref gives it from a mirror of its own, and the shared mirror is never written:
+         * the resolve only reads it, so one mirror serves every rank of a replicated group. */
+        const char* name = "two ranks resolve one shared mirror";
+        std::printf("  ..   %s\n", name);
+        Fix rank[2], ref[2];
+        for (int r = 0; r < 2; ++r) rank[r].shape(2, 16, 6, 4, 8);
+        rank[0].resident(0, 2);
+        rank[0].resident(3, 5);
+        rank[1].resident(1, 9);
+        rank[1].resident(2, 2);
+        rank[1].resident(5, 11);
+        const std::vector<uint8_t> mirror = rank[0].host;
+        /* The follower's own buffer is never read: poison it so a kernel that read it shows. */
+        std::fill(rank[1].host.begin(), rank[1].host.end(), (uint8_t)kNOB);
+        ref[0] = rank[0];
+        ref[1] = rank[1];
+        ref[1].host = mirror;
+        const int32_t calls[3][8] = { { 2, 5, 6, -1, 2, 4, -1, -1 },
+                                      { 7, 8, 9, 10, 11, 12, -1, -1 },
+                                      { 0, 2, 13, -1, 15, 9, 1, -1 } };
+        const int32_t counts[3][2] = { { 3, 2 }, { 4, 2 }, { 3, 3 } };
+        size_t bad = 0;
+        for (int c = 0; c < 3 && !bad; ++c)
+            for (int r = 0; r < 2; ++r) {
+                for (Fix* f : { &rank[r], &ref[r] }) {
+                    f->sel.assign(calls[c], calls[c] + 8);
+                    f->nsel.assign(counts[c], counts[c] + 2);
+                }
+                ref_resolve(ref[r]);
+                if (dev_resolve(rank[r], rank[0].host.data()) != RAD_OK) { ++bad; break; }
+                bad += mismatch(rank[r].sel, ref[r].sel, "sel", name);
+                bad += mismatch(rank[r].res, ref[r].res, "res", name);
+                bad += mismatch(rank[r].sblk, ref[r].sblk, "slot_block", name);
+                bad += mismatch(rank[r].sst, ref[r].sst, "slot_state", name);
+                bad += mismatch(rank[r].ctl, ref[r].ctl, "ctl", name);
+                bad += mismatch_bytes(rank[r].pool, ref[r].pool, "kv_cache", name);
+                bad += mismatch_bytes(rank[0].host, mirror, "host", name);
+            }
+        if (bad) { std::printf("  FAIL %s\n", name); ++fails; }
+        else std::printf("  ok   %s\n", name);
     }
     std::printf("%d of %d fixtures match libref\n", cases - fails, cases);
     return fails ? 1 : 0;

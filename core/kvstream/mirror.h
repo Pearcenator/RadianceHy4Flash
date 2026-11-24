@@ -17,13 +17,15 @@ namespace rad {
 
 struct KVGroupPlan;
 
-/* What the streamed groups need, before anything is taken: `host_bytes` of pinned mirror (each rank
- * its own shard) and `map_bytes` of residency map, reverse map, slot state and control block, all
- * taken from the KV pool itself and budgeted with it. Valid between plan_groups() and carve(). */
+/* What the streamed groups need, before anything is taken: `host_bytes` of pinned mirror this rank
+ * pins itself (a group it borrows, share(), costs it none: `shared` counts those) and `map_bytes`
+ * of residency map, reverse map, slot state and control block, all taken from the KV pool itself
+ * and budgeted with it. Valid between plan_groups() and carve(). */
 struct KVStreamCost {
     int64_t groups     = 0;
     int64_t host_bytes = 0;
     int64_t map_bytes  = 0;
+    int64_t shared     = 0;
 };
 
 /* The resolve's counters for the metrics; zeros on a server that does not stream. */
@@ -60,6 +62,15 @@ public:
      * for them, whether the pool backs them or not. */
     int64_t context_blocks(const KVGroupPlan& p, int64_t max_ctx, int64_t max_seqs) const;
 
+    /* X-05b: this rank reads and writes `group`'s mirror in the leader's allocation instead of
+     * pinning its own: every rank holds the same bytes for the group (rad_kv_group_replicated), so
+     * the ranks' mirrors would be copies of one another. Call before cost() and alloc(), which
+     * then takes the mirror from the `leader` store it is given; the maps and the ring stay this
+     * rank's. Every rank still stores into the one mirror: the same bytes at the same rows, within
+     * the step that wrote them (docs/KV-STREAMING.md §3.2). */
+    void share(int32_t group);
+    bool shared(int32_t group) const;
+
     void set_map(int32_t group, const Map& m);
     const Map* map(int32_t group) const;
 
@@ -75,13 +86,15 @@ public:
      * The maps are filled by init() after the carve backs the pool. On failure the mirrors taken
      * so far are released. */
     int  alloc(const std::vector<KVGroupPlan>& plans, int64_t max_ctx, int64_t max_seqs,
-               MemAllocator& host_alloc, Pool& kv_pool);
+               MemAllocator& host_alloc, Pool& kv_pool, const KVStreamStore* leader = nullptr);
 
     /* Fill the maps as a resolve expects them: `res` and `slot_block` -1, `slot_state` and `ctl`
      * zero. Call after carve(), then sync `s` before the first pass. */
     int  init(const std::vector<KVGroupPlan>& plans, RadStream s);
 
-    /* Free the mirrors; the maps go with the KV pool. Safe twice and after a failed bring-up. */
+    /* Free the mirrors this store pinned (a borrowed one is the leader's to free; no pass may run
+     * once any rank has released); the maps go with the KV pool. Safe twice and after a failed
+     * bring-up. */
     void release(MemAllocator& host_alloc);
 
     KVStreamStats stats(const std::vector<KVGroupPlan>& plans) const;
@@ -97,6 +110,7 @@ public:
 private:
     std::vector<int64_t> resident_tokens_;   /* by group handle: its pool's depth in tokens */
     std::vector<Map>     maps_;              /* set_map(), by group handle */
+    std::vector<uint8_t> shared_;            /* share(), by group handle */
     std::atomic<uint64_t> misses_{0};        /* note_traffic() */
     std::atomic<uint64_t> bytes_in_{0};
 };

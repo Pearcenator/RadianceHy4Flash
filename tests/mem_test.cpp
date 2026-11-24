@@ -1192,6 +1192,120 @@ static int read_stream_maps(const KVManager::StreamMap& m, const KVGroupPlan& p,
     return rc;
 }
 
+/* X-05b: a streamed group every rank declares replicated keeps one host mirror, the first rank's.
+ * The gate and the report count it once, every rank's view names the same bytes while its maps
+ * stay its own, and only the rank that pinned it frees it. A group one rank does not declare
+ * replicated, holds at another width or declares zero keeps a mirror a rank. */
+TEST(a_replicated_streamed_group_keeps_one_host_mirror_for_every_rank) {
+    constexpr int kRanks = 4;
+    struct Tp {
+        Fixture f[kRanks];
+        std::vector<KVManager*> kvs;
+        int plan(const std::function<void(int, std::vector<KVGroupInfo>&)>& edit) {
+            for (int r = 0; r < kRanks; ++r) {
+                f[r].cfg.checkpoint_slots = 0;
+                f[r].cfg.max_ctx = 1024;
+                if (int s = configure_pools(f[r].pools, f[r].cfg); s < 0) return s;
+                f[r].kv.cap_resident_tokens(G_FULL, 64);
+                std::vector<KVGroupInfo> g = hybrid_groups();
+                g[G_FULL].replicated = true;
+                if (edit) edit(r, g);
+                if (int s = f[r].kv.plan_groups(g, f[r].cfg); s < 0) return s;
+                kvs.push_back(&f[r].kv);
+            }
+            return RAD_OK;
+        }
+    };
+    {
+        Tp t;
+        CHECK_OK(t.plan(nullptr));
+        const int64_t one = t.f[0].kv.stream_cost().host_bytes;
+        REQUIRE(one > 0);
+        CHECK_EQ(kvstream_share(t.kvs), 1);
+        KVStreamHostUse use;
+        for (KVManager* kv : t.kvs) kvstream_host_add(&use, *kv);
+        CHECK_EQ(use.sum.host_bytes, one);                   /* once, not kRanks times */
+        CHECK_EQ(use.max_rank_bytes, one);
+        CHECK_EQ(use.sum.shared, (int64_t)(kRanks - 1));
+        CHECK(use.sum.map_bytes == kRanks * t.f[0].kv.stream_cost().map_bytes);
+        CHECK(!t.f[0].kv.stream_shared(G_FULL));
+        CHECK(t.f[1].kv.stream_shared(G_FULL));
+
+        /* A follower cannot bind a mirror nobody pinned. */
+        (void)stderr_of([&] {
+            CHECK(t.f[1].kv.alloc_stream(rad_malloc_allocator(), t.f[1].pools.kv(), &t.f[0].kv) < 0);
+        });
+        for (int r = 0; r < kRanks; ++r) {
+            CHECK_OK(t.f[r].kv.alloc_stream(rad_malloc_allocator(), t.f[r].pools.kv(), &t.f[0].kv));
+            CHECK_OK(t.f[r].kv.carve(t.f[r].pools.kv()));
+        }
+        const KVManager::StreamMap* m0 = t.f[0].kv.stream_map(G_FULL);
+        REQUIRE(m0 != nullptr && m0->host != nullptr);
+        for (int r = 1; r < kRanks; ++r) {
+            const KVManager::StreamMap* m = t.f[r].kv.stream_map(G_FULL);
+            REQUIRE(m != nullptr);
+            CHECK(m->host == m0->host);
+            CHECK_EQ(m->host_bytes, m0->host_bytes);
+            CHECK_EQ(m->host_layer_stride, m0->host_layer_stride);
+            CHECK(m->res != nullptr && m->res != m0->res);   /* residency is a rank's own ring's */
+            CHECK(m->ctl != m0->ctl);
+            REQUIRE(t.f[r].kv.stream_view(G_FULL) != nullptr);
+            CHECK(t.f[r].kv.stream_view(G_FULL)->host == m0->host);
+        }
+        /* What one rank stores, every rank's resolve reads. */
+        m0->host[m0->host_bytes - 1] = 0x5a;
+        CHECK_EQ((int)t.f[kRanks - 1].kv.stream_map(G_FULL)->host[m0->host_bytes - 1], 0x5a);
+
+        const std::string rep = stderr_of([&] {
+            KVStreamSetup s;
+            s.group_name = "full";
+            kvstream_report(s, use, kRanks);
+        });
+        CHECK(has(rep, "1 group(s) stream"));
+        CHECK(has(rep, "held once for the 4"));
+        /* A refusal names the one mirror, not a sum over the ranks. */
+        const std::string refusal = stderr_of([&] {
+            KVStreamHostUse big = use;
+            big.sum.host_bytes = big.max_rank_bytes = (int64_t)1 << 60;
+            CHECK_EQ(kvstream_host_gate(big, kRanks, 0, 0), RAD_E_NOMEM);
+        });
+        CHECK(has(refusal, "held once for the 4 ranks"));
+
+        /* The followers let go without freeing; the leader frees once (twice is still safe). */
+        for (int r = kRanks - 1; r >= 0; --r) t.f[r].kv.free_stream(rad_malloc_allocator());
+        t.f[0].kv.free_stream(rad_malloc_allocator());
+        CHECK(t.f[1].kv.stream_map(G_FULL)->host == nullptr);
+    }
+    /* Not the same on every rank: nothing is shared and each rank pins its own. */
+    const std::function<void(int, std::vector<KVGroupInfo>&)> differs[] = {
+        [](int r, std::vector<KVGroupInfo>& g) { if (r == 2) g[G_FULL].replicated = false; },
+        [](int r, std::vector<KVGroupInfo>& g) { if (r == 3) g[G_FULL].zero = true; },
+        [](int r, std::vector<KVGroupInfo>& g) { if (r == 1) g[G_FULL].decl.head_dim *= 2; },
+    };
+    for (const auto& edit : differs) {
+        Tp t;
+        CHECK_OK(t.plan(edit));
+        CHECK_EQ(kvstream_share(t.kvs), 0);
+        KVStreamHostUse use;
+        for (KVManager* kv : t.kvs) kvstream_host_add(&use, *kv);
+        CHECK_EQ(use.sum.shared, (int64_t)0);
+        CHECK(use.sum.host_bytes > use.max_rank_bytes);
+        CHECK_OK(t.f[0].kv.alloc_stream(rad_malloc_allocator(), t.f[0].pools.kv(), &t.f[0].kv));
+        CHECK_OK(t.f[1].kv.alloc_stream(rad_malloc_allocator(), t.f[1].pools.kv(), &t.f[0].kv));
+        const KVManager::StreamMap* a = t.f[0].kv.stream_map(G_FULL);
+        const KVManager::StreamMap* b = t.f[1].kv.stream_map(G_FULL);
+        CHECK(a && b && a->host && b->host && a->host != b->host);
+        for (int r = 0; r < 2; ++r) t.f[r].kv.free_stream(rad_malloc_allocator());
+    }
+    /* One rank shares nothing with itself. */
+    {
+        Tp t;
+        CHECK_OK(t.plan(nullptr));
+        std::vector<KVManager*> one{ t.kvs[0] };
+        CHECK_EQ(kvstream_share(one), 0);
+    }
+}
+
 TEST(a_streamed_plan_allocates_reports_and_frees_its_mirror) {
     /* The host mirror and the ring's maps, end to end: what stream_cost() promises is what
      * alloc_stream() takes, the mirror is zeroed (a block nothing wrote yet must read as zeros, not

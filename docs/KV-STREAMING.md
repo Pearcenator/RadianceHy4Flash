@@ -86,9 +86,28 @@ and a null `RadKVStream`, decided at startup.
 The mirror is `RAD_MEM_HOST_MAPPED`, so a kernel reads it over the link in place, and laid out like
 the pool: layer `l`'s row for block `b` is at `host + l * host_layer_stride + b * block_bytes`, with
 `block_bytes` both the resolve's row pitch and the length of every copy into the ring. It is
-`n_blocks * bytes_per_block`, zeroed at bring-up, and kept per rank, each rank with its own maps in
-its own pool (`kvstream_step_view`). It is the first in-place device writer of mapped host memory,
-so its coherence is pinned by a test (§6.2).
+`n_blocks * bytes_per_block`, zeroed at bring-up, each rank with its own maps in its own pool
+(`kvstream_step_view`). It is the first in-place device writer of mapped host memory, so its
+coherence is pinned by a test (§6.2).
+
+**One mirror for a group that is the same on every rank (X-05b).** A group every rank declares
+replicated (`rad_kv_group_replicated`, the claim the host tier's slot layout already rests on),
+none declares zero, and all hold at one width, depth and block size keeps one mirror: the first
+rank pins it and every other rank's `RadKVStream.host` names the same range (`kvstream_share`,
+`KVStreamStore::share`). Mapped pinned memory is one range at the same address on the host and on
+every card, so nothing else moves; the maps, the ring and the stage stay a rank's own. A group
+that differs on any rank keeps a mirror a rank.
+
+Every rank still runs the streamed store, so every rank writes the shared mirror: the same bytes
+at the same rows. That is safe by order, not by a lock. A rank's store precedes that layer's
+resolve and attention on its own stream, so a rank only reads rows it has itself written; and a
+row is rewritten with other bytes (a rejected draft's row, a restore) only by a later pass, which
+starts after this pass's result, which waits on every rank's collective for the layer, which
+follows that rank's store. The resolve and the stage copy only read the mirror. A single writer
+would need the store kernels to skip the mirror on the other ranks; that saves link writes, not
+memory, and is not done here. If the replication claim were false for a group, the ranks would now
+read whichever rank wrote last instead of each its own bytes: `RADIANCE_DEBUG_TIER_VERIFY` checks
+the same claim on the host tier's path.
 
 ### 3.3 The writer maintains both copies
 
@@ -220,8 +239,9 @@ lookups and misses with the largest union, misses and claims of one launch (`ctl
 
 ### 3.8 The host-RAM budget and the gate
 
-The mirror is the largest host allocation after the experts' pool: 4.69 GiB a rank for four
-204 800-token sequences of Flash-Next. `kvstream_host_gate` checks the mirrors once, before any rank
+The mirror is the largest host allocation after the experts' pool: 4.69 GiB for four
+204 800-token sequences of Flash-Next, once when the group is the same on every rank (§3.2) and
+once a rank otherwise. `kvstream_host_gate` checks the mirrors once, before any rank
 pins one, against the host tiers still to be pinned after them (the activation arenas and, when
 sized, the checkpoint store) plus `memory.host-headroom-mib`. A refusal names `max-model-len` and
 `max-num-seqs`, which size the mirror; `host-pool-mib` sizes the experts' tier and cannot make
@@ -302,7 +322,7 @@ times; the mirror is the tier); the prefix cache's host tier (§3.8); the expert
 1. **The carve split**: `n_slots` beside `n_blocks`, `layer_stride()` over `n_slots`, ids still in
    `[0, n_blocks)`.
 2. **The host mirror**: `n_blocks * bytes_per_block` of mapped pinned memory a streamed group and rank,
-   gated by `lockable_room`.
+   or a group when every rank holds it alike (§3.2), gated by `lockable_room`.
 3. **The maps**: device `res`, `slot_block`, `slot_state` per layer and a control block, from the KV
    pool, carried in the batch.
 4. **Report, key, metrics** (§3.7).
@@ -426,7 +446,10 @@ libref's; `scripts/kv-stage-parity-64k.sh` exercises the same write in the serve
 
 ### 6.3 Rank coverage
 
-Every rank resolves the same shared block ids through identically built maps of its own. Only
+Every rank resolves the same shared block ids through identically built maps of its own, out of
+one mirror when the group is replicated (§3.2: `mem_test`
+`a_replicated_streamed_group_keeps_one_host_mirror_for_every_rank`, `r4d_emu_kvres` "two ranks
+resolve one shared mirror"); the shared mirror has not run on cards. Only
 `tp: 1` and `tp: 2` have run; `tp: 3` and `tp: 4`, the uneven split, the attention-zero ranks
 and the four-card selftest cases are untested, and the per-rank view (`kvstream_step_view`) is the
 path to check first.

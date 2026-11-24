@@ -67,6 +67,16 @@ int64_t KVStreamStore::context_blocks(const KVGroupPlan& p, int64_t max_ctx,
     return kv_context_blocks(p.block_size, max_ctx, max_seqs);
 }
 
+void KVStreamStore::share(int32_t group) {
+    if (group < 0) return;
+    if ((size_t)group >= shared_.size()) shared_.resize((size_t)group + 1, 0);
+    shared_[(size_t)group] = 1;
+}
+
+bool KVStreamStore::shared(int32_t group) const {
+    return group >= 0 && (size_t)group < shared_.size() && shared_[(size_t)group] != 0;
+}
+
 void KVStreamStore::set_map(int32_t group, const Map& m) {
     if (group < 0) return;
     if ((size_t)group >= maps_.size()) maps_.resize((size_t)group + 1);
@@ -93,7 +103,8 @@ KVStreamCost KVStreamStore::cost(const std::vector<KVGroupPlan>& plans, int64_t 
         const int64_t blocks = context_blocks(p, max_ctx, max_seqs);
         const int64_t slots  = std::min(resident_blocks(p), blocks);
         if (blocks <= 0 || slots <= 0) continue;
-        c.host_bytes += blocks * p.bytes_per_block;
+        if (shared(p.index)) ++c.shared;
+        else c.host_bytes += blocks * p.bytes_per_block;
         c.map_bytes  += kvstream_map_bytes(blocks, slots, p.n_layers);
         ++c.groups;
     }
@@ -101,7 +112,7 @@ KVStreamCost KVStreamStore::cost(const std::vector<KVGroupPlan>& plans, int64_t 
 }
 
 int KVStreamStore::alloc(const std::vector<KVGroupPlan>& plans, int64_t max_ctx, int64_t max_seqs,
-                         MemAllocator& host_alloc, Pool& kv_pool) {
+                         MemAllocator& host_alloc, Pool& kv_pool, const KVStreamStore* leader) {
     for (const auto& p : plans) {
         if (!windowed(p.index) || p.zero || p.kind != RAD_KV_FULL) continue;
         const int64_t blocks = context_blocks(p, max_ctx, max_seqs);
@@ -113,7 +124,23 @@ int KVStreamStore::alloc(const std::vector<KVGroupPlan>& plans, int64_t max_ctx,
         m.block_bytes       = p.layer_bytes_per_block();
         m.host_layer_stride = blocks * m.block_bytes;
         m.host_bytes        = blocks * p.bytes_per_block;
-        m.host = static_cast<uint8_t*>(host_alloc.alloc(m.host_bytes, RAD_MEM_HOST_MAPPED));
+        const bool borrow = shared(p.index);
+        if (borrow) {
+            /* The leader's mirror, which it pinned (and zeroed) first; the same layout or none. */
+            const Map* lm = leader ? leader->map(p.index) : nullptr;
+            if (!lm || !lm->host || lm->host_bytes != m.host_bytes ||
+                lm->block_bytes != m.block_bytes || lm->host_layer_stride != m.host_layer_stride) {
+                RAD_ERR("KV group '%s': this rank shares the leader's host mirror of %s, and the "
+                        "leader holds %s: an engine bug", p.name.c_str(),
+                        humanb(m.host_bytes).c_str(),
+                        lm && lm->host ? "one of another layout" : "none");
+                release(host_alloc);
+                return RAD_E_STATE;
+            }
+            m.host = lm->host;
+        } else {
+            m.host = static_cast<uint8_t*>(host_alloc.alloc(m.host_bytes, RAD_MEM_HOST_MAPPED));
+        }
         if (!m.host) {
             RAD_ERR("KV group '%s': the host mirror of %s (%lld blocks of %s) could not be "
                     "allocated", p.name.c_str(), humanb(m.host_bytes).c_str(), (long long)blocks,
@@ -122,7 +149,7 @@ int KVStreamStore::alloc(const std::vector<KVGroupPlan>& plans, int64_t max_ctx,
             return RAD_E_NOMEM;
         }
         /* A block nothing has written is still copied in on a miss, so its bytes must be defined. */
-        std::memset(m.host, 0, (size_t)m.host_bytes);
+        if (!borrow) std::memset(m.host, 0, (size_t)m.host_bytes);
 
         /* One reservation for all of the group's maps, from the KV pool so its report names them. */
         const int64_t layers = p.n_layers > 0 ? p.n_layers : 1;
@@ -133,7 +160,7 @@ int KVStreamStore::alloc(const std::vector<KVGroupPlan>& plans, int64_t max_ctx,
         if (!at) {
             RAD_ERR("KV group '%s': its residency map and ring bookkeeping (%s) did not fit the "
                     "KV pool", p.name.c_str(), humanb(map_bytes).c_str());
-            host_alloc.free(m.host, RAD_MEM_HOST_MAPPED);
+            if (!borrow) host_alloc.free(m.host, RAD_MEM_HOST_MAPPED);
             release(host_alloc);
             return RAD_E_NOMEM;
         }
@@ -176,9 +203,10 @@ int KVStreamStore::init(const std::vector<KVGroupPlan>& plans, RadStream s) {
 }
 
 void KVStreamStore::release(MemAllocator& host_alloc) {
-    for (auto& m : maps_) {
+    for (size_t g = 0; g < maps_.size(); ++g) {
+        Map& m = maps_[g];
         if (!m.host) continue;
-        host_alloc.free(m.host, RAD_MEM_HOST_MAPPED);
+        if (!shared((int32_t)g)) host_alloc.free(m.host, RAD_MEM_HOST_MAPPED);
         /* Cleared, so a second call is a no-op. */
         m = Map{};
     }
