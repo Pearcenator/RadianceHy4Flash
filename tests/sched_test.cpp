@@ -3,6 +3,7 @@
  */
 #include "rad_test.h"
 
+#include "kvstream/bind.h"
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
 #include "sched/scheduler.h"
@@ -3231,6 +3232,62 @@ TEST(no_prefix_hit_gives_nothing_back) {
 }
 
 /* ================================================================== speculation */
+/* X-05a (docs/KV-STREAMING.md §6.4): a block drafter's two passes state the deployment's window,
+ * as the serial drafter's do, so kv_pass_view reads their rows against 1 + n_spec. Behind a decode
+ * step both keep the ring; left at 0 every verify-shaped pass read as wider than a decode step,
+ * took the stage, and the way back to the ring emptied its residency maps every step. Behind a
+ * step with a prefill chunk the context pass mirrors the chunk and still stages. */
+TEST(a_block_drafters_passes_carry_the_window_so_a_decode_steps_rows_keep_the_ring) {
+    using rad::KVView;
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 5;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160, 64), b = f.submit(100, 64);
+    REQUIRE(a && b);
+    REQUIRE(f.sch.step() != nullptr);          /* both prompts, one prefill step */
+    f.commit_plain(11);
+
+    Scheduler::BlockRow rows[4];
+    REQUIRE_EQ(f.sch.block_begin(/*block=*/6, /*depth=*/5, /*window=*/0, /*mask=*/99, rows, 4), 2);
+    const RadBatch* cb = f.sch.block_context(1);
+    REQUIRE(cb != nullptr);
+    CHECK_EQ(cb->n_spec, 5);
+    CHECK_EQ(cb->n_tok, 260);                  /* the chunks' rows: wider than a decode step */
+    CHECK(kv_pass_view(cb->phase, cb->n_tok, cb->n_seq, cb->n_spec) == KVView::Stage);
+    const RadBatch* qb = f.sch.block_query(1);
+    REQUIRE(qb != nullptr);
+    CHECK_EQ(qb->n_spec, 5);
+    CHECK_EQ(qb->n_seq, 2);
+    CHECK_EQ(qb->n_tok, 12);                   /* `block` rows a drafting sequence */
+    CHECK(qb->n_tok <= (int64_t)qb->n_seq * (1 + qb->n_spec));
+    CHECK(kv_pass_view(qb->phase, qb->n_tok, qb->n_seq, qb->n_spec) == KVView::Ring);
+    /* What the pass was before: the same rows with no window stage. */
+    CHECK(kv_pass_view(qb->phase, qb->n_tok, qb->n_seq, 0) == KVView::Stage);
+    f.sch.block_end();
+
+    /* A verify step of 1 + 5 rows a sequence: the context pass mirrors it and keeps the ring. */
+    int32_t draft[5] = { 21, 22, 23, 24, 25 };
+    CHECK_OK(f.sch.set_draft(a, draft, 5));
+    CHECK_OK(f.sch.set_draft(b, draft, 5));
+    const RadBatch* v = f.sch.step();
+    REQUIRE(v != nullptr);
+    CHECK_EQ(v->n_tok, 12);
+    CHECK(kv_pass_view(v->phase, v->n_tok, v->n_seq, v->n_spec) == KVView::Ring);
+    CHECK_OK(f.commit(12, 0, [](const StepEntry& e) { return e.n_spec; }));
+    REQUIRE_EQ(f.sch.block_begin(6, 5, 0, 99, rows, 4), 2);
+    cb = f.sch.block_context(2);
+    REQUIRE(cb != nullptr);
+    CHECK_EQ(cb->n_spec, 5);
+    CHECK_EQ(cb->n_tok, 12);
+    CHECK(kv_pass_view(cb->phase, cb->n_tok, cb->n_seq, cb->n_spec) == KVView::Ring);
+    qb = f.sch.block_query(2);
+    REQUIRE(qb != nullptr);
+    CHECK(kv_pass_view(qb->phase, qb->n_tok, qb->n_seq, qb->n_spec) == KVView::Ring);
+    f.sch.block_end();
+}
+
 TEST(rejection_rolls_back_paged_kv_and_moves_the_linear_read_offset) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64);

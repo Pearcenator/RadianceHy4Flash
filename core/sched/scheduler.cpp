@@ -4505,6 +4505,13 @@ const RadBatch* Scheduler::block_context(int step) {
 
     block_plan_.reset();
     block_plan_.phase      = RAD_PHASE_DECODE;
+    /* The deployment's window, as serial_batch states it: the pass's KV view is chosen from its
+     * row shape against 1 + n_spec (kv_pass_view). The pass mirrors the trunk step, so behind a
+     * decode step it is at most 1 + n_spec rows a sequence and keeps the ring the trunk left;
+     * behind a step with a prefill chunk it is wider and takes the stage as that step did. Left
+     * at reset()'s 0, a verify's rows read as wider than a decode step and the pass took the
+     * stage, which empties the ring's residency maps on the way back (kvstream_enter). */
+    block_plan_.n_spec     = cfg_.n_spec > 0 ? cfg_.n_spec : 0;
     block_plan_.draft_pass = -1;           /* the sign is what the plugin reads (rad_runtime.h) */
     block_plan_.e.reserve(block_.size());
 
@@ -4559,6 +4566,9 @@ const RadBatch* Scheduler::block_query(int step) {
 
     block_plan_.reset();
     block_plan_.phase      = RAD_PHASE_DECODE;
+    /* See block_context: `block` rows a drafting sequence, at most 1 + n_spec, so the pass
+     * resolves the ring (docs/KV-STREAMING.md §6.4 has the bound). */
+    block_plan_.n_spec     = cfg_.n_spec > 0 ? cfg_.n_spec : 0;
     block_plan_.draft_pass = 1;
     block_plan_.tok_shift  = 0;            /* the anchor sits at its own row; see StepPlan */
     block_plan_.e.reserve(block_.size());

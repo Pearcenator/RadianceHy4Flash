@@ -351,7 +351,8 @@ depth.
 
 `kv_pass_view` picks a pass's view: a decode pass of at most `1 + n_spec` rows a sequence takes the
 ring; every other pass (prefill, a mixed step, and a decode-classified pass wider than that, such as
-the serial drafter's history pass over a prefill chunk) takes the stage.
+the serial drafter's history pass over a prefill chunk) takes the stage. A block drafter's passes
+state the same window and follow the same rule (§6.4).
 
 ### 5.2 There is no streaming switch
 
@@ -397,6 +398,7 @@ whole context resident during prefill (the group would still carve `n_layers x c
 | a ring under one decode step's selection | raised at startup | `a_ring_below_one_decode_step_s_selection_is_raised_to_the_ceiling` |
 | a covering ring paying for streaming | `streams()` false, null `RadKVStream` | `a_ring_that_covers_the_context_streams_nothing_and_the_engine_pays_nothing`; `scripts/kv-parity.sh` |
 | a wide decode-classified pass resolving a ring it cannot fit | `kv_pass_view` takes the stage | `a_decode_pass_wider_than_a_verify_stages_instead_of_resolving_the_ring` |
+| a block drafter's pass staging behind a decode step, emptying the ring every step | both passes state the window (§6.4) | `sched_test` `a_block_drafters_passes_carry_the_window_so_a_decode_steps_rows_keep_the_ring`; `the_decode_bound_covers_a_block_drafters_query_pass`; `hyv4flash_arch_test` `a_streamed_sparse_group_resolves_the_draft_table_too` |
 | a mirror nothing writes | the store must resolve to a kernel for the group's geometry | `a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path`; `a_packed_cache_warns_that_the_layout_has_no_writer_and_serves_non_streamed`; `a_resolve_declared_for_another_group_does_not_enable_streaming` |
 | the flag honoured with no streamed path | the capability gate | `a_model_whose_architecture_declares_no_streamed_ops_ignores_the_flag`; `a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring` |
 | a stage reading the previous layer's bytes | the ordering rule (§3.5.1) | `a_streamed_groups_layers_may_all_alias_one_pool_slot`; `scripts/kv-stage-parity-64k.sh` |
@@ -435,3 +437,30 @@ The MTP head binds the same `kv_attn` group. A verify step issues one selection 
 ring, which is why the decode bound counts `1 + n_spec` rows (§3.9), and a decode-classified pass
 wider than that stages (§5.1). Whether the drafter should share the residency map with the trunk
 is open.
+
+**A block drafter** (Hy4-flash's DFly2, `arch/hyv4flash/hyv4flash_dfly.h`) has no cache of its
+own: its query pass stores `block` rows a drafting sequence into the trunk's sparse latent layers
+and attends through them, so it reads the streamed group through the trunk's maps. Both of its
+passes state the deployment's window (`Scheduler::block_context`, `block_query`), as the serial
+drafter's do, and `kv_pass_view` reads their rows against it:
+
+- the **query pass** is `block = 1 + depth` rows a sequence (6 for DFly2, 4 for its short block),
+  within `1 + n_spec`, so it takes the ring: each draft layer stores through `kv_store_streamed`,
+  resolves its table (`dfly_sel`'s rows and entry counts) and attends, as the trunk does;
+- the **context pass** mirrors the trunk step's rows. Behind a decode step it keeps the ring the
+  trunk left; behind a step with a prefill chunk it is as wide as the chunk and takes the stage, as
+  that step did. DFly2 issues nothing in it, but the pass still enters its view.
+
+The ring's decode bound covers the query pass. A draft row's table is two entries wider than the
+trunk's selection (`group_topk + 2`), but the rows of one sequence share it: the pages the anchor's
+trunk row recalled plus the block's own pages (`libref/ref_dfly.cpp`), at most `group_topk + 2`
+distinct blocks a sequence, under the `(1 + n_spec) x group_topk` the bound holds for it
+(`the_decode_bound_covers_a_block_drafters_query_pass`). A block longer than `1 + n_spec` is not
+covered and stages.
+
+Before X-05a both passes were built with a window of 0, so a verify-shaped pass read as wider
+than a decode step and staged; `kvstream_enter` then emptied the residency maps on the way back to
+the ring, and every decode step resolved its whole selection from the mirror again (largest launch
+misses equal to the largest launch union on every report line). What still empties the maps is a
+step that really stages: a prefill chunk, alone or beside decoders. The first ring pass behind it,
+which may be the drafter's query pass, refills from the mirror.

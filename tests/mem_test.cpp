@@ -1444,6 +1444,38 @@ TEST(a_decode_pass_wider_than_a_verify_stages_instead_of_resolving_the_ring) {
     CHECK(kv_pass_view(RAD_PHASE_DECODE, 2048, 4, 3) == KVView::Stage);
     CHECK(kv_pass_view(RAD_PHASE_DECODE, 2039, 3, 3) == KVView::Stage);
     CHECK(kv_pass_view(RAD_PHASE_DECODE, 2048, 4, 0) == KVView::Stage);
+    /* A block drafter's query pass (X-05a): `block` = 1 + depth rows a drafting sequence, here
+     * DFly2's 6 over eight sequences, and its short block of 4. It states the window, so it is a
+     * ring pass; stated as 0 (what the scheduler left before) the same rows staged, and the way
+     * back to the ring emptied the residency maps every decode step. */
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 48, 8, 5) == KVView::Ring);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 32, 8, 5) == KVView::Ring);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 6, 1, 5) == KVView::Ring);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 48, 8, 0) == KVView::Stage);
+    /* Its context pass mirrors the trunk step: a verify's rows keep the ring, a chunk's stage. */
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 6 + 1, 2, 5) == KVView::Ring);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 6 + 1024, 2, 5) == KVView::Stage);
+    /* A block longer than the window is not covered by the ring's bound, and stages. */
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 8, 1, 5) == KVView::Stage);
+}
+
+TEST(the_decode_bound_covers_a_block_drafters_query_pass) {
+    /* The ring is raised to max_seqs x (1 + n_spec) x sel_pitch blocks, the trunk's selection width
+     * (kvstream_ops takes the first kv_resolve's). A DFly2 query row's table is wider by two
+     * (group_topk + 2, hyv4flash_dfly.h), but the rows of one sequence share it: the pages the
+     * anchor's trunk row recalled plus the block's own, at most group_topk + 2 distinct blocks a
+     * sequence (libref/ref_dfly.cpp), under the (1 + n_spec) x group_topk the bound counts for it
+     * at every window that drafts. */
+    Config cfg;
+    for (const int64_t seqs : { 1, 8, 16 })
+        for (const int spec : { 1, 3, 5 })
+            for (const int64_t topk : { 2, 64, 512 }) {
+                cfg.max_seqs = seqs;
+                cfg.n_spec = spec;
+                CHECK(seqs * (topk + 2) <= kvstream_ceiling_blocks(cfg, topk));
+            }
+    cfg.max_seqs = 8; cfg.n_spec = 5;
+    CHECK_EQ(kvstream_ceiling_blocks(cfg, 512), (int64_t)24576);   /* the four-card run's ring */
 }
 
 TEST(a_ring_below_one_decode_step_s_selection_is_raised_to_the_ceiling) {

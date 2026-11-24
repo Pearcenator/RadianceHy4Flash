@@ -2645,26 +2645,44 @@ TEST(a_streamed_sparse_group_resolves_the_draft_table_too) {
     st.host = host.data(); st.res = res.data(); st.slot_block = slot_block.data();
     st.slot_state = slot_state.data(); st.ctl = ctl.data(); st.block_bytes = bbytes;
     st.host_layer_stride = bbytes * blocks; st.slots = slots; st.host_bytes = (int64_t)host.size();
-    Query qp(d.b, 1, 6, 5);
-    qp.k->kv[(size_t)m.kv_sparse - 1].stream = &st;
-    RadCtx c{ .b = &d.b, .batch = &qp.k->b };
-    hyv4flash::step(&c, &qp.k->b);
-    if (!c.step_fail.empty()) fprintf(stderr, "%s\n", c.step_fail.c_str());
-    CHECK(c.step_fail.empty());
-    CHECK_LINT(d.b, &c);
-    size_t store = SIZE_MAX, res_i = SIZE_MAX, attn = SIZE_MAX, plain = SIZE_MAX;
-    for (size_t i = 0; i < c.issues.size(); ++i) {
-        const rad_op op = c.issues[i].op;
-        if (op == L.op_store_stream) store = i;
-        if (op == L.op_store) plain = i;
-        if (op == L.op_resolve) res_i = i;
-        if (op == L.op_attn) attn = i;
+    /* X-05a: the core gives the query pass the ring (its `block` rows a sequence are within the
+     * window it states, sched_test and mem_test hold that half), so every draft layer resolves and
+     * none stages. On the stage (a block longer than the window) it stores twice and resolves
+     * nothing, as the trunk's staged pass does. */
+    for (int staged = 0; staged < 2; ++staged) {
+        Query qp(d.b, 1, 6, 5);
+        qp.k->kv[(size_t)m.kv_sparse - 1].stream = &st;
+        RadCtx c{ .b = &d.b, .batch = &qp.k->b };
+        c.stage_on = staged != 0;
+        hyv4flash::step(&c, &qp.k->b);
+        if (!c.step_fail.empty()) fprintf(stderr, "%s\n", c.step_fail.c_str());
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(d.b, &c);
+        for (const auto& Ld : m.df.lay) {
+            size_t store = SIZE_MAX, res_i = SIZE_MAX, attn = SIZE_MAX, plain = SIZE_MAX;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                const rad_op op = c.issues[i].op;
+                if (op == Ld.op_store_stream) store = i;
+                if (op == Ld.op_store) plain = i;
+                if (op == Ld.op_resolve) res_i = i;
+                if (op == Ld.op_attn) attn = i;
+            }
+            REQUIRE(store != SIZE_MAX && attn != SIZE_MAX);
+            if (staged) {
+                CHECK(plain != SIZE_MAX && store < plain && plain < attn);
+                CHECK_EQ(res_i, SIZE_MAX);
+                continue;
+            }
+            REQUIRE(res_i != SIZE_MAX);
+            CHECK(store < res_i && res_i < attn);
+            CHECK_EQ(plain, SIZE_MAX);
+            CHECK_EQ(c.issues[res_i].opd[0].handle, Ld.tab);
+            CHECK_EQ(c.issues[res_i].opd[1].handle, Ld.cnt);
+            CHECK_EQ(c.issues[res_i].n, (int64_t)6);   /* one selection a row of the block */
+        }
+        CHECK_EQ(c.stages.empty(), staged == 0);
+        CHECK_EQ(c.stages_next.empty(), staged == 0);
     }
-    REQUIRE(store != SIZE_MAX && res_i != SIZE_MAX && attn != SIZE_MAX);
-    CHECK(store < res_i && res_i < attn);
-    CHECK_EQ(plain, SIZE_MAX);
-    CHECK_EQ(c.issues[res_i].opd[0].handle, L.tab);
-    CHECK_EQ(c.issues[res_i].opd[1].handle, L.cnt);
 }
 
 /* §2: what the drafter cannot serve declares the manifest, names the reason, and declares no
