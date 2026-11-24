@@ -122,7 +122,7 @@ constexpr int kSamp = 2048, kSampRun = 32, kSampRuns = 64, kSampMinN = 3 * kSamp
 constexpr int kWideShift = 19, kWideCand = 3840, kMergeAbove = 512, kMergeCand = 1664;
 constexpr int kWideShiftSigned = 20;                                /* the signed key's 32 bits */
 int wide_shift(bool sgn) { return sgn ? kWideShiftSigned : kWideShift; }
-constexpr int kParM = 32, kParWMax = 16, kParCap = 8192;            /* the split path */
+constexpr int kParM = 128, kParWMax = 16, kParCap = 8192;           /* the split path */
 int par_chunks(int nb) { return std::max(1, std::min(kParWMax, (nb + 4095) / 4096)); }
 }
 
@@ -482,14 +482,15 @@ Fix fix_big_topk() {
     return f;
 }
 
-/* Where the launcher leaves the split path: 33 query rows (one past its 32), and topk 3000, whose
- * three chunk lists overflow its 8192 keys. Both take the single-workgroup kernel. */
+/* Where the launcher leaves the split path: 129 query rows (one past its 128), which take the wide
+ * kernel, and topk 3000, whose three chunk lists overflow its 8192 keys and take the
+ * single-workgroup kernel. */
 Fix fix_no_split(bool rows) {
-    Fix f; f.name = rows ? "33 rows: past the split path's 32" : "topk 3000: past the split path's lists";
-    const int M = rows ? 33 : 2, nb = rows ? 4500 : 9000, topk = rows ? 64 : 3000, ratio = 4;
+    Fix f; f.name = rows ? "129 rows: past the split path's 128" : "topk 3000: past the split path's lists";
+    const int M = rows ? Path::kParM + 1 : 2, nb = rows ? 4500 : 9000, topk = rows ? 64 : 3000, ratio = 4;
     f.shape(1, M, nb, nb, topk, ratio);
     f.cu = { 0, M }; f.nc = { nb - 10 };
-    for (int m = 0; m < M; ++m) f.pos[m] = 4 * (nb - 10 - 97 * m) + m % 4;
+    for (int m = 0; m < M; ++m) f.pos[m] = 4 * (nb - 10 - 31 * m) + m % 4;
     for (int b = 0; b < nb; ++b) f.page(0, b) = b % 17 == 1 ? -1 : (b * 389 + 1) % 200000;
     for (int m = 0; m < M; ++m)
         for (int b = 0; b < nb; ++b) f.score(m, b) = (float)((b * 29 + m * 3) % 211) * 0.0625f;
@@ -613,7 +614,9 @@ int main(int argc, char** argv) {
         for (int i = 0; i < n; ++i) fixtures.push_back([i] { return as_signed(fix_random(i), -1.0f, true); });
     } else {
         fixtures = { fix_decode, fix_prefill, fix_few_live, fix_wide_launch,
-                     [] { return fix_split(1, 4); }, [] { return fix_split(2, 4); }, fix_split_sparse, fix_big_topk,
+                     [] { return fix_split(1, 4); }, [] { return fix_split(2, 4); },
+                     /* A decode step's verify rows past the old 32: 8 sequences of 1 + 5 draft rows. */
+                     [] { return fix_split(8, 6); }, fix_split_sparse, fix_big_topk,
                      [] { return fix_no_split(true); }, [] { return fix_no_split(false); } };
         for (int d = 0; d < 5; ++d) fixtures.push_back([d] { return fix_wide(d); });
         for (int i = 0; i < 150; ++i) fixtures.push_back([i] { return fix_sweep(i); });

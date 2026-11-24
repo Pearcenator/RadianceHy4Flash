@@ -28824,6 +28824,9 @@ static void qsa_select_own_case(const Plugin& pl) {
                            { 1990 }, own);
         /* Many groups: the split path (nb 20001, 4 rows). */
         qsa_select_own_run(pl, "qsa_select at 20001 groups, 4 rows", 1, 4, 20001, { 79997 }, own);
+        /* A decode step's verify rows past 32 (K-25): 8 sequences of 1 + 5 draft rows, split path. */
+        qsa_select_own_run(pl, "qsa_select, 8 sequences of 6 rows at 15001 groups", 8, 6, 15001,
+                           { 59995, 52000, 40001, 30002, 20003, 12000, 8001, 2046 }, own);
     }
 }
 
