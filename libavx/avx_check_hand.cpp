@@ -5276,6 +5276,28 @@ static void hy4_cases(std::vector<Hand>& hs) {
          .pi("M", M).pi("n", n).pi("heads", H).pi("blocks", B).pi("seqs", S).ps("dtype", "f32");
         hs.push_back(std::move(h));
     }
+    for (int part : { 1, 2 }) {
+        /* The row split (row_part, runs of R = 2 rows over the same five): part 1 scores step rows
+         * 2 and 3 across the sequence boundary, part 2 row 4 and a row past the step (-inf); the
+         * rebased bounds are cu - p R. q and gate span the runs (six rows). */
+        const int64_t M = 5, H = 4, n = 24, B = 6, G = 10, S = 2, wide = 9, R = 2, Q = 6;
+        Hand h(part == 1 ? "row_part 1: a run across the sequence boundary"
+                         : "row_part 2: a run past the step's last row", "idx_score", 1e-5);
+        h.dense(RAD_F32, { Q, H * n }, hfill(541))
+         .dense(RAD_F32, { Q, H }, hfill(542))
+         .dense(RAD_F32, { G, n }, hfill(543))
+         .dense(RAD_I32, { S, B }, [](int64_t i) {
+             return i == 1 ? -1.0f : (i == 9 ? 12.0f : (float)((i * 3 + 1) % 10));
+         })
+         .idx({ 0, 2, M })
+         .idx({ 3, 5 })
+         .dense(RAD_F32, { R, wide }, sent, true)
+         .dense(RAD_I32, { S + 1 }, sent, true)
+         .pi("M", R).pi("n", n).pi("heads", H).pi("blocks", B).pi("seqs", S).ps("dtype", "f32")
+         .pi("row_part", part)
+         .expect(7, { -part * R, 2 - part * R, M - part * R });
+        hs.push_back(std::move(h));
+    }
 
     /* ---- qsa_select's `own` ------------------------------------------------------------------ */
     {

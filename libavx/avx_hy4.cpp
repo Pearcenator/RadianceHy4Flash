@@ -942,7 +942,8 @@ AVX_KERNEL(idx_pool_gated_i8) { return pool_gated(a, true, true); }
 
 /* score[m][b] = sum_h w_h relu(q[m][h] . key_b), w_h = gate[m][h] (heads n)^-0.5, the heads summed
  * as two halves in ascending order and the halves added. Blocks past nc[seq], with a page < 0 or
- * out of range, or past the table: -inf. */
+ * out of range, or past the table: -inf. row_part p (libref's): q and gate span the step, score
+ * holds R rows, step rows [p R, p R + R); cu_part gets cu - p R; rows past the step: -inf. */
 AVX_KERNEL(idx_score) {
     if (a->n_t < 7 || !rad_args_have(a, 7)) return RAD_E_INVAL;
     RadTensor q = a->t[0];
@@ -951,18 +952,30 @@ AVX_KERNEL(idx_score) {
     const int64_t n = p_int(a, "n", 0), H = p_int(a, "heads", 0);
     if (n < 1 || H < 1) return RAD_E_SHAPE;
     heads_view(q, H, n);
+    const int64_t part = p_int(a, "row_part", -1);
+    const RadTensor* cu_part = a->n_t > 7 ? rad_arg_in(a, 7) : nullptr;
+    if ((cu_part && part < 0) || (part >= 0 && !cu_part)) return RAD_E_INVAL;
     if (q.rank != 3 || q.shape[0] < 1 || q.shape[1] != H || q.shape[2] != n || gate.rank != 2 ||
         gate.shape[0] != q.shape[0] || gate.shape[1] < H || bt.rank != 2 || cu.rank != 1 ||
-        cu.shape[0] < 2 || score.rank != 2 || score.shape[0] != q.shape[0] || score.shape[1] < 1)
+        cu.shape[0] < 2 || score.rank != 2 || score.shape[1] < 1 ||
+        (part < 0 ? score.shape[0] != q.shape[0]
+                  : score.shape[0] < 1 || q.shape[0] < (part + 1) * score.shape[0]))
         return RAD_E_SHAPE;
+    if (cu_part && (cu_part->rank != 1 || cu_part->shape[0] != cu.shape[0])) return RAD_E_SHAPE;
+    if (cu_part && cu_part->dtype != RAD_I32) return RAD_E_DTYPE;
     const bool paged = key.rank == 4;
     if (paged ? (key.shape[1] != 1 || key.shape[2] * key.shape[3] != n || key.stride[3] != 1 ||
                  key.stride[2] != key.shape[3] || key.stride[0] < n)
               : (key.rank != 2 || key.shape[1] != n))
         return RAD_E_SHAPE;
-    const int64_t M = q.shape[0], n_seq = cu.shape[0] - 1, pages = key.shape[0];
-    if (bt.shape[0] < n_seq || numel(&nc) < n_seq || cuv(&cu, 0) != 0 || cuv(&cu, n_seq) != M)
+    const int64_t row0 = part > 0 ? part * score.shape[0] : 0, M = score.shape[0];
+    const int64_t n_seq = cu.shape[0] - 1, pages = key.shape[0], rows = cuv(&cu, n_seq);
+    if (bt.shape[0] < n_seq || numel(&nc) < n_seq || cuv(&cu, 0) != 0 ||
+        (part < 0 ? rows != M : rows > q.shape[0]))
         return RAD_E_SHAPE;
+    if (cu_part)
+        for (int64_t i = 0; i <= n_seq; ++i)
+            st_int_dt(cu_part->dtype, cu_part->data, offlin(cu_part, i), cuv(&cu, i) - row0);
     const float wscale = (float)(std::pow((double)H, -0.5) * std::pow((double)n, -0.5));
     const int64_t cols = std::min(score.shape[1], bt.shape[1]);
     const int64_t width = score.shape[1], half = H / 2;
@@ -970,9 +983,10 @@ AVX_KERNEL(idx_score) {
     const int64_t nchunk = (width + kChunk - 1) / kChunk, units = M * nchunk;
     HY4_PAR_DYN(M * cols * H * n)
     for (int64_t u = 0; u < units; ++u) {
-        const int64_t m = u / nchunk, b0 = (u % nchunk) * kChunk, b1 = std::min(b0 + kChunk, width);
+        const int64_t r = u / nchunk, b0 = (u % nchunk) * kChunk, b1 = std::min(b0 + kChunk, width);
+        const int64_t m = r + row0;   /* the step row */
         const int64_t s = seq_row(&cu, n_seq, m);
-        const int64_t nlive = std::min(ldi(&nc, offlin(&nc, s)), cols);
+        const int64_t nlive = m < rows ? std::min(ldi(&nc, offlin(&nc, s)), cols) : 0;
         float* tmp = scratch_f32((size_t)(H * n + n + kChunk + H + 16));
         float *qf = tmp, *kb = qf + H * n, *outv = kb + n, *wh = outv + kChunk;
         for (int64_t h = 0; h < H; ++h) {
@@ -995,7 +1009,7 @@ AVX_KERNEL(idx_score) {
             }
             outv[b - b0] = res;
         }
-        out_row(&score, m * score.stride[0] + b0 * score.stride[1], b1 - b0, outv);
+        out_row(&score, r * score.stride[0] + b0 * score.stride[1], b1 - b0, outv);
     }
     return RAD_OK;
 }
