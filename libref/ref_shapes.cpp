@@ -1295,6 +1295,7 @@ int ref_idx_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     o.t_idx({ S + 1 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);
     o.t_idx({ S }, 0, B, 0);                          /* nc */
     o.t((uint32_t)RAD_F32, { M, B });                 /* score */
+    o.skip();   // cu_part: a part's rebased bounds, exercised by the split's own tests.
     return o.finish("idx_score", operand, out);
 }
 

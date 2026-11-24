@@ -1677,6 +1677,7 @@ static const RadOperandSpec oIdxPoolGatedFp8[] = {
 };
 static const RadParamSpec pIdxScore[] = {
     P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"), P_INT("seqs"), P_STR("dtype"),
+    P_INTO("row_part"),
 };
 static const RadOperandSpec oIdxScore[] = {
     { "q",     RAD_OPD_IN,  0 },
@@ -1686,6 +1687,9 @@ static const RadOperandSpec oIdxScore[] = {
     { "cu",    RAD_OPD_IN,  0 },
     { "nc",    RAD_OPD_IN,  0 },
     { "score", RAD_OPD_OUT, 0 },
+    /* row_part p: score's R rows are step rows [p R, p R + R), and cu_part the step's cu minus p R,
+     * which qsa_select reads over those rows (dsa_score's split, arch/common/rad_glm_tp.h). */
+    { "cu_part", RAD_OPD_OUT, 1 },
 };
 
 /* `rmsnorm_quant_fp8` and `gated_quant_fp8`, new ops whose schemas this plugin fixes. Each is its

@@ -267,9 +267,9 @@ static const RadOperandSpec oIdxPoolGated[] = { OPD("k"), WGT("wv"), WGT("wg"), 
 static const RadOperandSpec oIdxPoolGatedFp8[] = { OPD("k"), WGT("wv"), WGT("wg"), WGT("ape"),
     WGT("gain"), OPD("pos"), OPD_O("page"), INOUT_O("cache"), OUT_O("q"), OUT_O("scale") };
 static const RadParamSpec pIdxScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
-    P_INT("seqs"), P_STR("dtype") };
+    P_INT("seqs"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oIdxScore[] = { OPD("q"), OPD("gate"), OPD("k"), OPD("bt"), OPD("cu"),
-    OPD("nc"), OUT("score") };
+    OPD("nc"), OUT("score"), OUT_O("cu_part") };
 static const RadParamSpec pEngramIds[] = { P_INT("M"), P_INT("heads"), P_INT("ngram"),
     P_INT("pad"), P_INT("map_size"), P_INTO("image"), P_INTO("video") };
 static const RadOperandSpec oEngramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"), OPD("pos"),

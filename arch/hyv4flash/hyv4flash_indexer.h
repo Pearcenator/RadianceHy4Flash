@@ -24,11 +24,19 @@
  * codes at an f32 scale amax / 127 a key and a query head row: idx_pool_gated_i8, dsa_query_i8 and
  * dsa_score at dtype int8 (iu8 WMMA, int32 sums). Selection is qsa_select's in all modes. The exact
  * path stays the default: HF is the parity reference, and both quantised forms move near-ties
- * (notes/wp14.md, notes/idxint8.md). */
+ * (notes/wp14.md, notes/idxint8.md).
+ *
+ * Under tensor parallelism the exact path splits a prefill-sized selecting step's scoring and
+ * selection by query rows, GLM's DsaCache split (arch/common/rad_glm_tp.h): rank r scores and
+ * selects its run of rows (idx_score row_part, qsa_select over the rebased bounds) and three
+ * all_gathers join the runs' tables, counts and lengths. Each row runs the same kernels on the same
+ * operands as replicated, so the joined planes are the replicated ones' bits. The query side stays
+ * replicated. RADIANCE_HY4_IX_SPLIT=0 keeps every rank on the whole step. */
 #ifndef HYV4FLASH_INDEXER_H
 #define HYV4FLASH_INDEXER_H
 
 #include "hyv4flash_attn.h"
+#include <arch/rad_glm_tp.h>
 
 namespace hyv4flash {
 
@@ -53,20 +61,33 @@ struct IndexWire {
     rad_buf qscale = 0;   /* [T * Hi, 1] f32 */
     rad_buf iwf = 0;      /* [T, Hi] f32 head weights (dsa_score's gates) */
     /* taps only */
+    /* the row split only (split_on): a rank's rebased bounds and its run's answers */
+    rad_buf cu_part = 0;  /* [seqs + 1] i32 */
+    rad_buf sel_part = 0; /* [part, group_topk] i32 */
+    rad_buf nsel_part = 0, len_part = 0; /* [part] i32 */
     rad_buf zero_pos = 0; /* [work] i32 zeros: the pooled key before its rotation */
     rad_buf ident = 0;    /* [seqs, blocks] i32 the identity table: selections as group indices */
     rad_buf sel_ids = 0;  /* [T, group_topk] i32 */
-    int64_t work = 0, blocks = 0, ring = 0;
+    int64_t work = 0, blocks = 0, ring = 0, part = 0;
+    /* One i32 length a row is the narrowest gathered row, so a run is a multiple of four rows. */
+    static constexpr int64_t kGatherRowBytes = 4;
+    static bool split_on(const Shape& s, const Geom& g) {
+        const char* e = std::getenv("RADIANCE_HY4_IX_SPLIT");
+        return g.world > 1 && !s.ix_fp8 && !taps_on() && !(e && !std::strcmp(e, "0"));
+    }
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g) {
-        const int64_t T = g.max_tok, D = s.ix_dim, R = s.sparse.qk_rope, Hi = s.ix_heads;
-        work = (T + s.ix_pool - 1) / s.ix_pool + g.max_seqs;
+        const int64_t T0 = g.max_tok, D = s.ix_dim, R = s.sparse.qk_rope, Hi = s.ix_heads;
+        part = split_on(s, g) ? GlmTp::run_rows(T0, g.world, kGatherRowBytes) : 0;
+        /* A split's query planes are read and its answers gathered as world whole runs. */
+        const int64_t T = std::max(T0, part * g.world);
+        work = (T0 + s.ix_pool - 1) / s.ix_pool + g.max_seqs;
         blocks = (g.max_ctx + s.ix_pool - 1) / s.ix_pool + 1;
         ring = s.ix_pool + g.max_spec;
         /* RADIANCE_HY4_TEST_RING=<delta> (a test, WP13.0): a ring smaller or larger by delta rows,
          * to show the rollback gate's probes can fail. Never set in service. */
         if (const char* e = std::getenv("RADIANCE_HY4_TEST_RING"); e && *e)
             ring = std::max<int64_t>(1, ring + std::strtoll(e, nullptr, 10));
-        tk = decl_b(b, nm.f("ix.token_keys"), RAD_BF16, { T, D });
+        tk = decl_b(b, nm.f("ix.token_keys"), RAD_BF16, { T0, D });
         stage = decl_b(b, nm.f("ix.stage"), RAD_BF16, { work * s.ix_pool, D });
         page = decl_b(b, nm.f("ix.page"), RAD_I32, { work });
         /* Under M-RoPE a group rotates at its first token's three components, side by side as
@@ -78,13 +99,20 @@ struct IndexWire {
         iqr = decl_b(b, nm.f("ix.query_rope"), RAD_BF16, { T, Hi * R });
         iq = decl_b(b, nm.f("ix.query"), RAD_BF16, { T, Hi, D });
         iw = decl_b(b, nm.f("ix.head_weights"), RAD_BF16, { T, Hi });
-        score = decl_b(b, nm.f("ix.score"), RAD_F32, { T, blocks });
+        score = decl_b(b, nm.f("ix.score"), RAD_F32, { T0, blocks });
         sel = decl_b(b, nm.f("ix.selected"), RAD_I32, { T, s.ix_group_topk });
         nsel = decl_b(b, nm.f("ix.nsel"), RAD_I32, { T });
         len = decl_b(b, nm.f("ix.length"), RAD_I32, { T });
         if (!tk || !stage || !page || !bpos || !nc || !iqn || !iqr || !iq || !iw || !score ||
             !sel || !nsel || !len)
             return RAD_E_INVAL;
+        if (part) {
+            cu_part = decl_b(b, nm.f("ix.cu_part"), RAD_I32, { g.max_seqs + 1 });
+            sel_part = decl_b(b, nm.f("ix.selected_part"), RAD_I32, { part, s.ix_group_topk });
+            nsel_part = decl_b(b, nm.f("ix.nsel_part"), RAD_I32, { part });
+            len_part = decl_b(b, nm.f("ix.length_part"), RAD_I32, { part });
+            if (!cu_part || !sel_part || !nsel_part || !len_part) return RAD_E_INVAL;
+        }
         if (s.ix_fp8) {
             iqf = decl_b(b, nm.f("ix.query_rows"), RAD_BF16, { T * Hi, D });
             qcodes = decl_b(b, nm.f("ix.query_codes"), s.ix_i8 ? RAD_I8 : RAD_F8E4M3, { T * Hi, D });
@@ -117,6 +145,9 @@ struct Indexer {
     rad_op op_q_rope = 0, op_qn_copy = 0, op_qr_copy = 0, op_score = 0, op_select = 0;
     rad_op op_q_rows = 0, op_q_quant = 0, op_gate_f32 = 0;   /* RADIANCE_HY4_INDEXER=int8 */
     rad_op op_tap_zero = 0, op_tap_pool = 0, op_tap_ident = 0, op_tap_select = 0, op_tap_nsel0 = 0;
+    /* The row split (IndexWire::split_on) */
+    rad_op op_score_part = 0, op_select_part = 0, op_gather_sel = 0, op_gather_nsel = 0,
+           op_gather_len = 0;
     Tap t_token_keys{}, t_group_keys{}, t_sel{}, t_nsel{}, t_score{};
 
     /* `index` is the indexer cache group, declared by the caller right before this (block 4,
@@ -277,6 +308,36 @@ struct Indexer {
                          RAD_INT("seqs", g.max_seqs), RAD_INT("signed", 1), RAD_INT("own", 1) },
                        {}, { w.score, w.nc }, { w.sel, w.nsel, w.len });
         HY4_NEED(op_select, "qsa_select (own)");
+        if (w.part) {
+            /* Declared whatever the step size, each gather's message a range of rows (GLM's
+             * DsaCache): an arena level declares again at a smaller max_tok. */
+            const int64_t P = w.part, G = s.ix_group_topk;
+            op_score_part = mk(b, "idx_score",
+                               { RAD_RANGE("M", 1, P), RAD_INT("n", D), RAD_INT("heads", Hi),
+                                 RAD_INT("blocks", w.blocks), RAD_INT("seqs", g.max_seqs),
+                                 RAD_STR("dtype", "bf16"), RAD_INT("row_part", g.rank) },
+                               {}, { w.iq, w.iw, w.nc }, { w.score, w.cu_part });
+            op_select_part = mk(b, "qsa_select",
+                                { RAD_RANGE("M", 1, P), RAD_INT("blocks", w.blocks),
+                                  RAD_INT("topk", G - 1), RAD_INT("ratio", r),
+                                  RAD_INT("seqs", g.max_seqs), RAD_INT("signed", 1),
+                                  RAD_INT("own", 1) },
+                                {}, { w.score, w.nc, w.cu_part },
+                                { w.sel_part, w.nsel_part, w.len_part });
+            auto gather = [&](int64_t width, rad_buf from, rad_buf to) {
+                return mk(b, "all_gather",
+                          { RAD_INT("world_size", g.world),
+                            RAD_RANGE("numel", IndexWire::kGatherRowBytes * width, P * width),
+                            RAD_STR("dtype", "f32") },
+                          {}, { from }, { to });
+            };
+            op_gather_sel = gather(G, w.sel_part, w.sel);
+            op_gather_nsel = gather(1, w.nsel_part, w.nsel);
+            op_gather_len = gather(1, w.len_part, w.len);
+            HY4_NEED(op_score_part, "idx_score row_part");
+            HY4_NEED(op_select_part && op_gather_sel && op_gather_nsel && op_gather_len,
+                     "qsa_select and all_gather (the indexer's row split)");
+        }
 
         /* Taps: the token keys; each closing group's pooled key before its rotation (the pool
          * again at position 0, which turns nothing); the selection as group indices (the select
@@ -396,6 +457,30 @@ struct Indexer {
         rows.spans([&](int64_t src, int64_t dst, int64_t count) {
             head.step(c, act(xa), w.iw, T, src, count, dst);
         });
+        if (op_score_part && M >= GlmTp::kSplitRows) {
+            /* Rank r scores rows [r R, r R + R) (rows past the step score -inf) and selects the
+             * ones it holds (GlmTp::run_of; a rank past a small step selects its dead rows at 0),
+             * against the bounds the scorer rebased; the gathers lay the runs end to end, so rows
+             * past M land past the step. */
+            const int64_t W = g.world, Rr = GlmTp::run_rows(M, W, IndexWire::kGatherRowBytes);
+            const GlmTp::Run run = GlmTp::run_of(M, W, g.rank, IndexWire::kGatherRowBytes);
+            const RadOperand cup = brows(w.cu_part, S + 1);
+            RAD_ISSUE_N(c, op_score_part, Rr, brows(w.iq, W * Rr), brows(w.iw, W * Rr),
+                        kv_cache(index, layer),
+                        praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), qcu,
+                        brows(w.nc, S), bcol_at(w.score, 0, w.blocks, 0, p.live, Rr), cup);
+            RAD_ISSUE_N(c, op_select_part, run.rows,
+                        bcol_at(w.score, 0, w.blocks, 0, p.live, run.rows),
+                        praw2(ab->block_table, RAD_I32, S, ab->block_table_pitch), brows(w.nc, S),
+                        praw(queries->positions + run.first, RAD_I32, run.rows), cup,
+                        brows(w.sel_part, run.rows), brows(w.nsel_part, run.rows),
+                        brows(w.len_part, run.rows));
+            RAD_ISSUE_N(c, op_gather_sel, Rr * s.ix_group_topk, brows(w.sel_part, Rr),
+                        brows(w.sel, W * Rr));
+            RAD_ISSUE_N(c, op_gather_nsel, Rr, brows(w.nsel_part, Rr), brows(w.nsel, W * Rr));
+            RAD_ISSUE_N(c, op_gather_len, Rr, brows(w.len_part, Rr), brows(w.len, W * Rr));
+            return true;
+        }
         const RadOperand score = bcol_at(w.score, 0, w.blocks, 0, p.live, M);
         if (s.ix_fp8) {
             const int64_t Hi = s.ix_heads;

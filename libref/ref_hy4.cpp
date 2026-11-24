@@ -898,24 +898,39 @@ int ref_idx_score(const RadArgs* a, RadStream) {
     const int64_t n = p_int(a, "n", 0), H = p_int(a, "heads", 0);
     if (n < 1 || H < 1) return RAD_E_SHAPE;
     heads_view(q, H, n);
+    /* row_part p: q and gate span the step, score holds R rows, step rows [p R, p R + R); cu_part
+     * gets cu - p R (dsa_score's split). Rows past the step score -inf. */
+    const int64_t part = p_int(a, "row_part", -1);
+    const RadTensor* cu_part = t_in(a, 7);
+    if ((cu_part && part < 0) || (part >= 0 && !cu_part)) return RAD_E_INVAL;
     if (q.rank != 3 || q.shape[0] < 1 || q.shape[1] != H || q.shape[2] != n || gate.rank != 2 ||
         gate.shape[0] != q.shape[0] || gate.shape[1] < H || bt.rank != 2 || cu.rank != 1 ||
-        cu.shape[0] < 2 || score.rank != 2 || score.shape[0] != q.shape[0] || score.shape[1] < 1)
+        cu.shape[0] < 2 || score.rank != 2 || score.shape[1] < 1 ||
+        (part < 0 ? score.shape[0] != q.shape[0]
+                  : score.shape[0] < 1 || q.shape[0] < (part + 1) * score.shape[0]))
         return RAD_E_SHAPE;
+    if (cu_part && (cu_part->rank != 1 || cu_part->shape[0] != cu.shape[0])) return RAD_E_SHAPE;
+    if (cu_part && cu_part->dtype != RAD_I32) return RAD_E_DTYPE;
     const bool paged = key.rank == 4;
     if (paged ? (key.shape[1] != 1 || key.shape[2] * key.shape[3] != n || key.stride[3] != 1 ||
                  key.stride[2] != key.shape[3] || key.stride[0] < n)
               : (key.rank != 2 || key.shape[1] != n))
         return RAD_E_SHAPE;
-    const int64_t M = q.shape[0], n_seq = cu.shape[0] - 1, pages = key.shape[0];
-    if (bt.shape[0] < n_seq || numel(&nc) < n_seq || cu_at(&cu, 0) != 0 || cu_at(&cu, n_seq) != M)
+    const int64_t row0 = part > 0 ? part * score.shape[0] : 0, M = score.shape[0];
+    const int64_t n_seq = cu.shape[0] - 1, pages = key.shape[0], rows = cu_at(&cu, n_seq);
+    if (bt.shape[0] < n_seq || numel(&nc) < n_seq || cu_at(&cu, 0) != 0 ||
+        (part < 0 ? rows != M : rows > q.shape[0]))
         return RAD_E_SHAPE;
+    if (cu_part)
+        for (int64_t i = 0; i <= n_seq; ++i)
+            st_int(cu_part->dtype, cu_part->data, offlin(cu_part, i), cu_at(&cu, i) - row0);
     const float wscale = (float)(std::pow((double)H, -0.5) * std::pow((double)n, -0.5));
     const int64_t cols = std::min(score.shape[1], bt.shape[1]);
     REF_PAR_FOR(M * cols * H * n)
-    for (int64_t m = 0; m < M; ++m) {
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t m = r + row0;   /* the step row */
         const int64_t s = seq_of(&cu, n_seq, m);
-        const int64_t nlive = std::min(ld_idx(&nc, s), cols);
+        const int64_t nlive = m < rows ? std::min(ld_idx(&nc, s), cols) : 0;
         const int64_t half = H / 2;
         std::vector<float> wh((size_t)H);
         for (int64_t h = 0; h < H; ++h) wh[(size_t)h] = ldt(&gate, m * gate.stride[0] + h * gate.stride[1]) * wscale;
@@ -935,7 +950,7 @@ int ref_idx_score(const RadArgs* a, RadStream) {
                 }
                 out = lo + hi;
             }
-            stt(&score, m * score.stride[0] + b * score.stride[1], out);
+            stt(&score, r * score.stride[0] + b * score.stride[1], out);
         }
     }
     return RAD_OK;

@@ -760,6 +760,143 @@ static void ihc_junction() {
     }
 }
 
+/* The indexer's row split (hyv4flash_indexer.h, GLM's DsaCache split): rank r of W scores rows
+ * [r R, r R + R) with idx_score row_part r and selects the rows it holds (GlmTp::run_of: a rank
+ * past a small step selects its dead rows from 0) over the rebased bounds; the runs laid end to
+ * end must be the replicated idx_score + qsa_select's bytes over the step's M rows: the table, the
+ * counts, the lengths and the scores. The fixtures cross the tiled form's 256-row rule (replicated
+ * tiled, parts per-row), leave a rank past the step, and select from more groups than topk. libref
+ * is held to the same split when it serves row_part. */
+static void idx_split() {
+    struct G { std::vector<int> qn, ctx; int W; };
+    const int64_t H = 16, n = 128, ratio = 4, GT = 16, BT = 130, pages = 600;
+    const int32_t kSent = 0x5a5a5a5a;
+    for (const G& g : { G{ { 70, 1, 200, 30 }, { 400, 120, 480, 64 }, 4 },
+                        G{ { 5, 4 }, { 100, 60 }, 4 },
+                        G{ { 3, 250, 40 }, { 260, 500, 90 }, 2 } }) {
+        ++g_cases;
+        const int64_t S = (int64_t)g.qn.size(), W = g.W;
+        std::vector<int32_t> cu = { 0 }, pos, nc;
+        for (int64_t s = 0; s < S; ++s) {
+            cu.push_back(cu.back() + g.qn[(size_t)s]);
+            for (int i = 0; i < g.qn[(size_t)s]; ++i) pos.push_back(g.ctx[(size_t)s] - g.qn[(size_t)s] + i);
+            nc.push_back(g.ctx[(size_t)s] / (int)ratio);
+        }
+        const int64_t M = cu.back(), R = 4 * ((M + 4 * W - 1) / (4 * W)), Q = W * R;
+        pos.resize((size_t)Q, 0);
+        Rng rng((uint32_t)(M * 31 + W));
+        std::vector<uint16_t> q((size_t)(Q * H * n)), gate((size_t)(Q * H)), key((size_t)(pages * n));
+        for (auto& v : q) v = f2b(rng.n() * 0.5f);
+        for (auto& v : gate) v = f2b(rng.r(10) == 0 ? 0.0f : rng.n());
+        for (auto& v : key) v = f2b(rng.n() * 0.5f);
+        std::vector<int32_t> bt((size_t)(S * BT));
+        for (auto& v : bt) v = rng.r(29) == 3 ? -1 : (int32_t)rng.r((uint32_t)pages);
+        auto tens = [](const void* p, uint32_t dt, std::vector<int64_t> sh) {
+            RadTensor t{};
+            t.data = const_cast<void*>(p); t.dtype = dt; t.rank = (uint32_t)sh.size();
+            int64_t st = 1;
+            for (int i = (int)sh.size() - 1; i >= 0; --i) { t.shape[i] = sh[(size_t)i]; t.stride[i] = st; st *= sh[(size_t)i]; }
+            return t;
+        };
+        /* idx_score over the step (part < 0) or part `part`'s R rows. */
+        auto score = [&](RadLaunchFn fn, int part, std::vector<float>& out, std::vector<int32_t>& cup) {
+            const int64_t rows = part < 0 ? M : R, qr = part < 0 ? M : Q;
+            out.assign((size_t)(rows * BT), 7.0f);
+            cup.assign((size_t)(S + 1), kSent);
+            std::vector<RadParam> p = { pi("M", rows), pi("n", n), pi("heads", H), pi("blocks", BT),
+                                        pi("seqs", S), ps("dtype", "bf16") };
+            if (part >= 0) p.push_back(pi("row_part", part));
+            std::vector<RadTensor> t = {
+                tens(q.data(), RAD_BF16, { qr, H, n }), tens(gate.data(), RAD_BF16, { qr, H }),
+                tens(key.data(), RAD_BF16, { pages, 1, 4, n / 4 }), tens(bt.data(), RAD_I32, { S, BT }),
+                tens(cu.data(), RAD_I32, { S + 1 }), tens(nc.data(), RAD_I32, { S }),
+                tens(out.data(), RAD_F32, { rows, BT }) };
+            if (part >= 0) t.push_back(tens(cup.data(), RAD_I32, { S + 1 }));
+            RadArgs a{};
+            a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+            return fn(&a, nullptr);
+        };
+        /* qsa_select (signed, own) over `rows` score rows, the scratch the engine gives. */
+        auto select = [&](const float* sc, int64_t rows, const int32_t* pp, const int32_t* cp,
+                          int32_t* se, int32_t* ns, int32_t* su) {
+            std::vector<RadParam> p = { pi("M", rows), pi("blocks", BT), pi("topk", GT - 1),
+                                        pi("ratio", ratio), pi("seqs", S), pi("signed", 1), pi("own", 1) };
+            std::vector<RadTensor> t = {
+                tens(sc, RAD_F32, { rows, BT }), tens(bt.data(), RAD_I32, { S, BT }),
+                tens(nc.data(), RAD_I32, { S }), tens(pp, RAD_I32, { rows }),
+                tens(cp, RAD_I32, { S + 1 }), tens(se, RAD_I32, { rows, GT }),
+                tens(ns, RAD_I32, { rows }), tens(su, RAD_I32, { rows }) };
+            RadArgs a{};
+            a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+            const int64_t need = r4d_rad_qsa_select_scratch(&a);
+            std::vector<uint32_t> scratch((size_t)(need / 4 + 1), 0xA5A5A5A5u);
+            a.scratch = scratch.data(); a.scratch_bytes = need;
+            return r4d_rad_qsa_select(&a, nullptr);
+        };
+        char w[140];
+        std::snprintf(w, sizeof w, "indexer row split M %lld over %lld ranks (runs of %lld): gathered = replicated",
+                      (long long)M, (long long)W, (long long)R);
+        std::vector<float> sc_rep, sc_part, sc_gath((size_t)(Q * BT), 7.0f);
+        std::vector<int32_t> cu_unused, cup, se_rep((size_t)(M * GT), kSent), ns_rep((size_t)M, kSent),
+            su_rep((size_t)M, kSent), se_g((size_t)(Q * GT), kSent), ns_g((size_t)Q, kSent),
+            su_g((size_t)Q, kSent);
+        int rc = score(r4d_rad_idx_score, -1, sc_rep, cu_unused);
+        if (rc == RAD_OK) rc = select(sc_rep.data(), M, pos.data(), cu.data(), se_rep.data(), ns_rep.data(), su_rep.data());
+        bool cu_ok = true;
+        for (int64_t r = 0; r < W && rc == RAD_OK; ++r) {
+            int64_t first = r * R, rows = std::min(R, M - first);
+            if (rows <= 0) { first = 0; rows = R; }   /* GlmTp::run_of */
+            rc = score(r4d_rad_idx_score, (int)r, sc_part, cup);
+            for (int64_t i = 0; i <= S; ++i) cu_ok &= cup[(size_t)i] == cu[(size_t)i] - (int32_t)(r * R);
+            std::vector<int32_t> se((size_t)(R * GT), kSent), ns((size_t)R, kSent), su((size_t)R, kSent);
+            if (rc == RAD_OK) rc = select(sc_part.data(), rows, pos.data() + first, cup.data(), se.data(), ns.data(), su.data());
+            std::copy(sc_part.begin(), sc_part.end(), sc_gath.begin() + r * R * BT);
+            std::copy(se.begin(), se.end(), se_g.begin() + r * R * GT);
+            std::copy(ns.begin(), ns.end(), ns_g.begin() + r * R);
+            std::copy(su.begin(), su.end(), su_g.begin() + r * R);
+        }
+        if (rc != RAD_OK) { std::printf("FAIL %s: launch rc=%d\n", w, rc); ++g_fails; continue; }
+        int64_t full = 0, dead = 0;
+        for (int64_t m = 0; m < M; ++m) full += ns_rep[(size_t)m] >= GT - 1 && pos[(size_t)m] / ratio > GT;
+        for (int64_t m = M * BT; m < Q * BT; ++m) dead += !std::isinf(sc_gath[(size_t)m]);
+        const bool same = !std::memcmp(se_g.data(), se_rep.data(), se_rep.size() * 4) &&
+                          !std::memcmp(ns_g.data(), ns_rep.data(), ns_rep.size() * 4) &&
+                          !std::memcmp(su_g.data(), su_rep.data(), su_rep.size() * 4);
+        const bool sc_same = !std::memcmp(sc_gath.data(), sc_rep.data(), sc_rep.size() * 4);
+        /* libref's row_part over the same runs, where it has one. */
+        const char* ref_note = "libref not loaded";
+        bool ref_ok = true;
+        if (const RadKernelInfo* ref = libref_op("idx_score")) {
+            std::vector<float> want, part_out;
+            std::vector<int32_t> rcup;
+            if (score(ref->launch, -1, want, cu_unused) != RAD_OK) { ref_ok = false; ref_note = "libref failed"; }
+            else if (score(ref->launch, 0, part_out, rcup) != RAD_OK) ref_note = "libref without row_part";
+            else {
+                ref_note = "libref's parts = its step";
+                for (int64_t r = 0; r < W && ref_ok; ++r) {
+                    ref_ok = score(ref->launch, (int)r, part_out, rcup) == RAD_OK;
+                    for (int64_t i = 0; i < R && ref_ok; ++i) {
+                        const int64_t m = r * R + i;
+                        for (int64_t b = 0; b < BT; ++b) {
+                            const float x = part_out[(size_t)(i * BT + b)];
+                            ref_ok &= m < M ? !std::memcmp(&x, &want[(size_t)(m * BT + b)], 4) : std::isinf(x) && x < 0;
+                        }
+                    }
+                    for (int64_t i = 0; i <= S; ++i) ref_ok &= rcup[(size_t)i] == cu[(size_t)i] - (int32_t)(r * R);
+                }
+            }
+        }
+        if (!same || !sc_same || !cu_ok || dead || !full || !ref_ok) {
+            std::printf("FAIL %s: tables %s, scores %s, cu_part %s, %lld live past the step, %lld full rows, %s%s\n",
+                        w, same ? "equal" : "DIFFER", sc_same ? "equal" : "DIFFER", cu_ok ? "ok" : "WRONG",
+                        (long long)dead, (long long)full, ref_note, ref_ok ? "" : " DIFFER");
+            ++g_fails;
+        } else {
+            std::printf("ok   %s (%lld rows select %lld of more; %s)\n", w, (long long)full, (long long)GT, ref_note);
+        }
+    }
+}
+
 int main() {
     ihc_pre();
     ihc_post();
@@ -771,6 +908,7 @@ int main() {
     engram_norm_gate();
     dfly_sel();
     idx_score_forms();
+    idx_split();
     std::printf("%d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;
 }

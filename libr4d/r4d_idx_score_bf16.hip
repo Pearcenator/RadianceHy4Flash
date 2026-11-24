@@ -217,7 +217,14 @@ void idx_score_tile_kernel(IDX_SCORE_PARAMS, int M) {
 // Test hook (r4d.h): 0 the launcher's rule, 1 the per-row form, 2 the row-tiled form.
 extern "C" void r4d_idx_score_pin_form(int form) { g_idx_score_form = form; }
 
-enum { IS_Q = 0, IS_GATE = 1, IS_K = 2, IS_BT = 3, IS_CU = 4, IS_NC = 5, IS_SCORE = 6 };
+/* row_part: the step's cu rebased to the part's first row, which the part then scores against and
+ * qsa_select reads over the part's rows; rows past the step fall in no sequence and score -inf. */
+__global__ void idx_rebase_kernel(const int32_t* cu, int32_t* out, int n, int row0) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = cu[i] - row0;
+}
+
+enum { IS_Q = 0, IS_GATE = 1, IS_K = 2, IS_BT = 3, IS_CU = 4, IS_NC = 5, IS_SCORE = 6,
+       IS_CU_PART = 7 };
 
 extern "C" int r4d_rad_idx_score(const RadArgs* a, RadStream stream) {
     const RadTensor* q  = r4d_opt(a, IS_Q);
@@ -250,6 +257,22 @@ extern "C" int r4d_rad_idx_score(const RadArgs* a, RadStream stream) {
     if (M < 1 || M > (1ll << 30)) return R4D_NO(RAD_E_SHAPE);
     if (g->rank != 2 || g->shape[0] != M || g->shape[1] < H || g->stride[1] != 1)
         return R4D_NO(RAD_E_SHAPE);
+    /* row_part p (dsa_score's split): q and gate span the step, score holds R = its rows, rows
+     * [p R, p R + R) are scored against cu - p R, written to cu_part first. */
+    const long long part = r4d_geti_or(a, "row_part", -1);
+    const RadTensor* cp = r4d_opt(a, IS_CU_PART);
+    long long row0 = 0;
+    if (part >= 0) {
+        if (!cp || cp->dtype != RAD_I32) return R4D_NO(cp ? RAD_E_DTYPE : RAD_E_INVAL);
+        if (o->rank != 2 || o->shape[0] < 1 || cp->rank != 1 || cp->stride[0] != 1 ||
+            cu->stride[0] != 1 || cp->shape[0] != cu->shape[0] || part > (1ll << 30) / o->shape[0] ||
+            M < (part + 1) * o->shape[0])
+            return R4D_NO(RAD_E_SHAPE);
+        row0 = part * o->shape[0];
+        M = o->shape[0];
+    } else if (cp) {
+        return R4D_NO(RAD_E_INVAL);
+    }
     /* The keys: the cache [pages, 1, 4, n/4] (a page `stride[0]` apart) or flat [G, n]. */
     long long pages = 0, key_ld = 0;
     if (k->rank == 4) {
@@ -276,9 +299,19 @@ extern "C" int r4d_rad_idx_score(const RadArgs* a, RadStream stream) {
     const float wscale = (float)(std::pow((double)H, -0.5) * std::pow((double)n, -0.5));
     const bool chain = r4d_geti_or(a, "chain", 0) != 0;
     const bool tiled = g_idx_score_form == 2 || (g_idx_score_form == 0 && M >= kTileRows);
+    const unsigned short* qp = (const unsigned short*)r4d_p(q);
+    const unsigned short* gp = (const unsigned short*)r4d_p(g);
+    const int32_t* cup = (const int32_t*)r4d_p(cu);
+    if (part >= 0) {
+        if (qp) qp += row0 * q->stride[0];
+        if (gp) gp += row0 * g->stride[0];
+        const int rc = R4D_EMIT(stream, idx_rebase_kernel, dim3(1), dim3(64), 0, cup,
+                                (int32_t*)r4d_wp(cp), (int)cu->shape[0], (int)row0);
+        if (rc != RAD_OK) return rc;
+        cup = (const int32_t*)r4d_p(cp);
+    }
 #define R4D_ISC_ARGS                                                                            \
-    (const unsigned short*)r4d_p(q), (const unsigned short*)r4d_p(g),                           \
-        (const unsigned short*)r4d_p(k), (const int32_t*)r4d_p(bt), (const int32_t*)r4d_p(cu),  \
+    qp, gp, (const unsigned short*)r4d_p(k), (const int32_t*)r4d_p(bt), cup,                    \
         (const int32_t*)r4d_p(nc), (float*)r4d_wp(o), (int)nseq, (int)cols, (int)out_cols,      \
         (int)pages, (long)q->stride[0], (long)g->stride[0], (long)key_ld, (long)bt->stride[0],  \
         (long)o->stride[0], wscale
