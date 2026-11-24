@@ -3438,7 +3438,8 @@ static void scatter_protect_at(const RadKernelInfo* rs, int64_t M, int64_t nl, i
  * without the shared arm, under both gates, with dropped slots, at a width ending inside a column
  * group, at top_k = 16 (K-18's form, and Hy4-flash's decode), and at Qwen3.8-Flash-Next's
  * 2048-token chunk on a rank of four (also timed). A decode step (under the cap), a top_k past the
- * wide form's registers, and a width not tiled by sixteen-byte pieces must refuse the wide pin;
+ * wide form's registers, and a width not tiled by sixteen-byte pieces must refuse the wide pin
+ * (the weights' dtype is no reason to: f32 ones take it, K-45);
  * and a shape without top_k = 16 or with such a width must refuse the sixteen-slot pin.
  * `wide` says whether the shape takes the wide form. */
 struct MoeGatherShape { int64_t M, n, k; const char* act; bool wide; };
@@ -3558,7 +3559,7 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
     for (const Var& v : kVar) {
         const std::string label = "moe_gather, " + std::string(v.name) + at;
         const int rc = run(v.form, got);
-        if ((v.wide && (!sh.wide || f32)) || (v.six && !sixteen)) {
+        if ((v.wide && !sh.wide) || (v.six && !sixteen)) {
             /* A shape the form cannot take refuses the pin rather than run another form. */
             ok((label + " is refused").c_str(), rc == RAD_E_UNSUPPORTED, "rc=" + std::to_string(rc));
             continue;
@@ -3578,7 +3579,7 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
                " differ from a column a thread" + first);
     }
 
-    if (M >= 2048 && sh.wide && !f32) {
+    if (M >= 2048 && sh.wide) {
         hipEvent_t e0, e1;
         st_ev_create(&e0);
         st_ev_create(&e1);
@@ -3596,9 +3597,9 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
             return ms * 1000.0f / (float)it;
         };
         const float t1 = time(1), t2 = time(2);
-        std::printf("      moe_gather at %lld routed rows x %lld: a column a thread %.1f us, a wave "
-                    "a token %.1f us a call, prepass included\n",
-                    (long long)NS, (long long)n, t1, t2);
+        std::printf("      moe_gather at %lld routed rows x %lld, %s weights: a column a thread %.1f "
+                    "us, a wave a token %.1f us a call, prepass included\n",
+                    (long long)NS, (long long)n, f32 ? "f32" : "bf16", t1, t2);
         st_ev_destroy(e0);
         st_ev_destroy(e1);
     }
@@ -3660,12 +3661,19 @@ static void moe_gather_case(const Plugin& pl) {
         for (int64_t n : { 2560, 4096 })
             for (bool shared : { false, true })
                 moe_gather_at(pl, r, { m, n, 16, shared ? "none" : nullptr, false }, true);
+    // K-45: Hy4-flash's prefill, f32 weights and top_k 16 past the self-scan bound: the wide form,
+    // pinned against the scalar form, and timed at a 2048-row chunk.
+    for (int64_t m : { 48, 2048 })
+        for (bool shared : { false, true })
+            moe_gather_at(pl, r, { m, 2560, 16, shared ? "none" : nullptr, true }, true);
     // HYV3's TP1 shared combine is the unity-gate form. Preserve the routed BF16 narrow
     // before adding the shared BF16 output, at decode and past the self-scan boundary.
     for (int64_t m : { 1, 4, 65 })
         for (int64_t n : { 2048, 4096 })
             for (bool shared : { false, true })
-                moe_gather_at(pl, r, { m, n, 8, shared ? "none" : nullptr, false }, true);
+                /* 65 rows x top 8 is past the self-scan bound, so f32 weights take the wide form
+                 * (K-45): pinned against the scalar form like bf16. */
+                moe_gather_at(pl, r, { m, n, 8, shared ? "none" : nullptr, m * 8 > 512 }, true);
 }
 
 /* ------------------------------------------------------- the vocab-parallel top-R, end to end
@@ -23819,12 +23827,13 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
     moefuse_router(pl, rows, 0, iters, true);
     moefuse_gather(pl, rows, false, iters);
     /* the quantising gather: the sixteen-slot form at `rows`, the wide one at 40 (M > 32 with bf16
-     * weights), each form pinned at 40, and f32 routing weights (which offer only the sixteen) */
+     * weights), each form pinned at 40, and f32 routing weights (both forms, K-45) */
     moefuse_gather_q8(pl, rows, 128, false, 0, iters);
     if (rows <= 32) {
         moefuse_gather_q8(pl, 40, 128, false, 0, iters);
         moefuse_gather_q8(pl, 40, 128, false, 3, iters);
         moefuse_gather_q8(pl, 40, 128, true, 0, iters);
+        moefuse_gather_q8(pl, 40, 128, true, 2, iters);
         moefuse_gather_q8(pl, 40, 256, false, 0, iters);
     }
 }
@@ -38577,14 +38586,14 @@ static void device_phase(const Plugin& pl) {
         for (int64_t rows : { 1, 48, 128 }) moefuse_router(pl, rows, 2, -1, true);
     }
     if (sel("moe_gather_inv_i8g")) {
-        /* both groups an IQ8R trunk or an ordinary one takes, both weight dtypes (bf16 offers the
-         * wide form above the self-scan height, f32 only the sixteen-slot one), and each pin. */
+        /* both groups an IQ8R trunk or an ordinary one takes, both weight dtypes (both offer the
+         * wide form above the self-scan height, f32 since K-45), and each pin. */
         for (int64_t rows : { 1, 6, 48, 65, 256 })
             for (int64_t g8 : { (int64_t)128, (int64_t)256 })
                 for (bool f32w : { false, true }) moefuse_gather_q8(pl, rows, g8, f32w, 0, -1);
         for (int pin : { 2, 3 }) {
             moefuse_gather_q8(pl, 40, 128, false, pin, -1);
-            moefuse_gather_q8(pl, 40, 256, true, 3, -1);
+            moefuse_gather_q8(pl, 40, 256, true, pin, -1);
         }
     }
     if (sel("moe_scatter_inv_i32") || sel("moe_gather_inv_bf16")) {
