@@ -815,8 +815,9 @@ private:
     std::vector<int64_t>   ck_stage_off_, ck_stage_lb_;
     int  ckpt_stage_open();
     /* Before a step: a step with a checkpoint inside it arms every rank's Ctx
-     * (Ctx::set_ckpt_snap); every other step disarms them. */
-    int  ckpt_stage_arm(const RadBatch* b);
+     * (Ctx::set_ckpt_snap); every other step disarms them. `ahead`: b was issued ahead, and its
+     * plan is Scheduler::next_plan(). */
+    int  ckpt_stage_arm(const RadBatch* b, bool ahead);
     /* A tree drafter (rad_drafter_tree), driven on the card only: ADV_BTAKE takes its parents,
      * ADV_COMPACT moves the accepted path's K and V after the acceptance, and ADV_CTXTREE stages
      * the context pass by that path. */

@@ -904,6 +904,53 @@ TEST(a_lone_prefill_without_a_span_takes_its_tail_snapshot_inside_its_last_chunk
     CHECK_EQ(b_ck, 2368);
 }
 
+/* X-02: several prompts, one of which ends in a lone spanned step with its tail snapshot inside it,
+ * while the next step (its first decode row beside the other prompt's chunk, and later a decoder)
+ * is issued ahead. The step with the snapshot inside holds that one sequence and is cut there; the
+ * step issued ahead carries no snapshot inside and no cut. Engine::ckpt_stage_arm must read the
+ * plan issued ahead (next_plan) for it: plan() is still the step with the snapshot inside, which
+ * failed the X-02 image's first card run ("checkpoint lies inside the step ... not cut there"). */
+TEST(a_step_issued_ahead_of_a_lone_prefill_with_its_snapshot_inside_carries_no_cut) {
+    Fixture f;
+    f.build(4096, 64, 2048);
+    f.cfg.checkpoint_interval = 1024;
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    f.sch.set_ckpt_inside(true);
+    std::vector<uint64_t> ids = { f.submit(2200, 6), f.submit(5000, 6) };
+    auto interior = [](const StepPlan& p) -> const StepEntry* {
+        for (const StepEntry& e : p.e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) return &e;
+        return nullptr;
+    };
+    int seen = 0, inside = 0, bad_cut = 0, bad_ahead = 0;
+    const RadBatch* b = f.sch.step();
+    for (int k = 0; b && k < 200; ++k) {
+        for (uint64_t id : ids)
+            if (Request* r = f.sch.find(id)) r->speculation_fixed = true;
+        const StepEntry* in = interior(f.sch.plan());
+        if (in) {
+            ++inside;
+            if (f.sch.plan().e.size() != 1 || b->ckpt_cut != in->ckpt_tok + 1) ++bad_cut;
+        }
+        const RadBatch* nb = f.sch.step_next();
+        if (nb) {
+            if (interior(f.sch.next_plan()) || nb->ckpt_cut != 0) ++bad_ahead;
+            if (in) ++seen;
+        }
+        f.commit_plain();
+        if (k == 2) ids.push_back(f.submit(100, 40));   /* a decoder joins */
+        if (nb) { f.sch.promote_next(); b = nb; }
+        else    b = f.sch.step();
+    }
+    /* The first prompt's tail, inside its last chunk; the second's last chunk shares its step with
+     * the decoder, so its tail is a cut. */
+    CHECK(inside >= 1);
+    CHECK(seen >= 1);         /* the failing shape: a step issued ahead behind one of them */
+    CHECK_EQ(bad_cut, 0);
+    CHECK_EQ(bad_ahead, 0);
+}
+
 /* A span moves no checkpoint and no piece, from a prompt's start or from any checkpoint a turn
  * resumes from: every chunk end and checkpoint it makes is one a span of 1 makes, and the deepest
  * checkpoint (where the next turn resumes) is the same. */

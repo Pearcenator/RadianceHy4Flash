@@ -1248,7 +1248,7 @@ int Engine::prepare_release(const RadBatch* b, bool ahead) {
     kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
     /* A checkpoint inside the step: every rank's Ctx copies into its stage (Ctx::set_ckpt_snap). */
-    return ckpt_stage_arm(b);
+    return ckpt_stage_arm(b, ahead);
 }
 
 int Engine::issue_ahead(const RadBatch** out) {
@@ -1953,10 +1953,12 @@ int Engine::ckpt_stage_open() {
     return RAD_OK;
 }
 
-int Engine::ckpt_stage_arm(const RadBatch* b) {
+int Engine::ckpt_stage_arm(const RadBatch* b, bool ahead) {
     if (ck_stage_off_.empty()) return RAD_OK;
     const StepEntry* in = nullptr;
-    for (const StepEntry& e : sched_.plan().e)
+    /* A step issued ahead is armed while the step before it, whose plan() may carry a snapshot
+     * inside it, still runs: its own plan is next_plan() until promote_next. */
+    for (const StepEntry& e : (ahead ? sched_.next_plan() : sched_.plan()).e)
         if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) in = &e;
     if (in && b && b->ckpt_cut <= 0 && !b->draft_pass && !b->enc && !b->gen) {
         /* save_checkpoints would take the stage for it, which this step does not write. */
