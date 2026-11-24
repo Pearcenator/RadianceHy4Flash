@@ -334,6 +334,13 @@ struct Indexer {
             op_gather_sel = gather(G, w.sel_part, w.sel);
             op_gather_nsel = gather(1, w.nsel_part, w.nsel);
             op_gather_len = gather(1, w.len_part, w.len);
+            static bool said = false;   /* once a process: arena levels declare again */
+            if (!said) {
+                said = true;
+                fprintf(stderr, "radiance: hyv4flash: indexer rows split over %d ranks from %lld "
+                                "rows (RADIANCE_HY4_IX_SPLIT=0 keeps them whole)\n",
+                        g.world, (long long)GlmTp::kSplitRows);
+            }
             HY4_NEED(op_score_part, "idx_score row_part");
             HY4_NEED(op_select_part && op_gather_sel && op_gather_nsel && op_gather_len,
                      "qsa_select and all_gather (the indexer's row split)");
