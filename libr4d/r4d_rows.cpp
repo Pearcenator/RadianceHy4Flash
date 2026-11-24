@@ -1251,6 +1251,29 @@ static const RadOperandSpec oMoeGemmQ[] = {
     { "y",             RAD_OPD_OUT,  0 },
     { "split",         RAD_OPD_IN,   1 },
 };
+/* moe_gemm_q_swiglu (K-53): moe_gemm_q over a two-part gate_up with swiglu_clamped_had_quant_i8g
+ * folded into its epilogue -- moe_gemm_q's parameters and `limit`, its operands with that op's
+ * `q` and `scale` in place of `y` (no bf16 product: the routed down projection reads the codes),
+ * and `split` after them. The weights keep moe_gemm_q's operand positions, so its layout hooks
+ * serve them. */
+static const RadParamSpec pMoeGemmQSwiglu[] = {
+    P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
+    P_STR("a_order"), P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"), P_INTO("parts"),
+    P_INTO("a_group"), P_F64("limit"),
+};
+static const RadOperandSpec oMoeGemmQSwiglu[] = {
+    { "a",             RAD_OPD_IN,   0 },
+    { "a_scale",       RAD_OPD_IN,   1 },
+    { "w",             RAD_OPD_WTAB, 0 },
+    { "w_scale",       RAD_OPD_WTAB, 0 },
+    { "sorted_tok",    RAD_OPD_IN,   0 },
+    { "expert_offset", RAD_OPD_IN,   0 },
+    { "w_odd",         RAD_OPD_WTAB, 0 },
+    { "w_odd_scale",   RAD_OPD_WTAB, 0 },
+    { "q",             RAD_OPD_OUT,  0 },
+    { "scale",         RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
+};
 /* The same GEMM over four classes by expert number mod 4: `w`/`w_scale` hold class 0 at [N, K],
  * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4. Four ranks
  * cannot share a five-block expert's extra block evenly over two classes, but can over four: rank
@@ -4109,6 +4132,11 @@ static const RadOpSchema kSchemas[] = {
            "hold class 0 at [N, K] and `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry "
            "e/4 of class e%4. The output is as wide as the widest class in `parts` stacked parts, "
            "and a narrower class fills each part's leading columns and zeros the rest."),
+    SCHEMA("moe_gemm_q_swiglu", pMoeGemmQSwiglu, oMoeGemmQSwiglu,
+           "moe_gemm_q over a two-part gate_up (`parts` 2) followed by swiglu_clamped_had_quant_i8g "
+           "over its [T, 2n] output (n = max(N, N_odd) / 2, `limit` its clamp, group 128): the "
+           "outputs are that op's int8 codes of the rotated clamped product and its f32 scale per "
+           "(row, 128 columns), and no [T, 2n] tensor is written. `split` as moe_gemm_q's."),
     SCHEMA("moe_gather", pMoeGather, oMoeGather,
            "scatters the sorted expert output back to token order and weights it. The sum over a "
            "token's slots runs in ASCENDING SLOT order, which is what makes it reproducible -- "
@@ -5678,6 +5706,14 @@ static const RadConstraint cMoeGemmI8[] = {
 static const RadConstraint cMoeGemmIqr[] = {
     C_GE("M", 1), C_DIV("N", 16), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 512),
     C_GE("top_k", 1), C_EQ("group", 128), C_IN("dtype", "i8a8h"), C_IN("a_group", "128 256"),
+};
+/* ...with the swiglu epilogue: gate and up the two parts, each whole 128-column groups. The decode
+ * band (r4d_moe.hip's, by the routed rows against the experts) is not a band of M alone, so the
+ * launch refuses it and the architecture declares the op above it (rad_block_moe_fp8.h). */
+static const RadConstraint cMoeGemmIqrSwiglu[] = {
+    C_GE("M", 1), C_DIV("N", 256), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("top_k", 1), C_EQ("group", 128), C_IN("dtype", "i8a8h"), C_IN("a_group", "128 256"),
+    C_EQ("parts", 2),
 };
 static const RadConstraint cMoeGemmW4I8[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
@@ -9867,6 +9903,24 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_moe_gemm_iqr_mod4, r4d_rad_moe_gemm_iqr_scratch,
   r4d_rad_layout_moe_iqr_mod4, r4d_rad_relayout_moe_iqr_mod4, nullptr,
   r4d_rad_unrelayout_moe_iqr_mod4 },
+
+{ "moe_gemm_iqr_swiglu", "moe_gemm_q_swiglu", "moe",
+  "moe_gemm_iqr's run-map and packed-map grids over a gate_up with swiglu_clamped_had_quant_i8g's "
+  "pass in the epilogue: a block per (map entry, 128-column group of the product), its four waves "
+  "taking the group's eight gate tiles and then the eight up tiles at the same columns, the bf16 "
+  "gate and then the clamped product staged in LDS, the rows rotated and quantised once all waves "
+  "are done, so the [T, 2n] bf16 plane and the quantiser's launch are gone",
+  "as moe_gemm_iqr above r4d_moe.hip's decode band (refused inside it), two classes, `parts` 2, "
+  "n = N / 2 a multiple of 128, a positive finite limit",
+  "as moe_gemm_iqr's inputs; the QUANTISER's outputs: int8 codes of the rotated product and an f32 "
+  "scale per (row, 128 columns). Byte-identical to moe_gemm_iqr followed by "
+  "swiglu_clamped_had_quant_i8g",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGemmIqrSwiglu), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gemm_iqr_swiglu, r4d_rad_moe_gemm_iqr_scratch,
+  r4d_rad_layout_moe_iqr, r4d_rad_relayout_moe_iqr, nullptr, r4d_rad_unrelayout_moe_iqr,
+  /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
+  r4d_fuse_moe_gemm_q_swiglu },
 
 { "moe_gemm_w4a8i8", "moe_gemm_q", "moe",
   "moe_gemm_w4a8 against an INT8 activation: the same stored planes, the nibbles expanded to int8 "

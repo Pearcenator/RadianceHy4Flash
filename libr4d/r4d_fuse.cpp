@@ -510,6 +510,48 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_iqr(const RadParam* p, int n_p, uint64_t
 }
 
 /* ==========================================================================================
+ * moe_gemm_q_swiglu -- moe_gemm_q over a two-part gate_up, then swiglu_clamped_had_quant_i8g over
+ * its output (K-53). (row: moe_gemm_iqr_swiglu; kernel: libr4d/r4d_moe_iqr.hip, moe_iqr_body's SW
+ * form: each tile rounds to the bf16 moe_gemm_iqr stores, and the product, rotation and codes are
+ * gated_quant_fp8_body's ACT 3 expression over those bytes.)
+ *
+ * Operands: [0] a  [1] a_scale  [2] w  [3] w_scale  [4] sorted_tok  [5] expert_offset  [6] w_odd
+ *           [7] w_odd_scale  [8] q  [9] scale  [10] split?
+ *
+ * The GEMM's temporary is the [T, 2n] gate_up the pair writes and reads, T = M * top_k routed rows
+ * and n = max(N, N_odd) / 2. The quantiser's `M` is those rows: its row has no band, so its high
+ * bound stands for a range. */
+extern "C" int r4d_fuse_moe_gemm_q_swiglu(const RadParam* p, int n_p, uint64_t present, int step,
+                                          RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), top_k = pi(p, n_p, "top_k");
+    const int64_t N_odd = pi(p, n_p, "N_odd", N), width = N_odd > N ? N_odd : N;
+    if (M <= 0 || N <= 0 || top_k <= 0 || pi(p, n_p, "parts", 1) != 2 || width % 256)
+        return RAD_E_UNSUPPORTED;
+    if (pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+
+    switch (step) {
+    case 0: {
+        Step s(out, "moe_gemm_q");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "n_expert")
+         .mirror(p, n_p, "top_k").mirror(p, n_p, "group").mirror(p, n_p, "a_order")
+         .mirror(p, n_p, "dtype").mirror_opt(p, n_p, "N_odd").mirror_opt(p, n_p, "K_odd")
+         .mirror(p, n_p, "parts").mirror_opt(p, n_p, "a_group");
+        /* a, a_scale, w, w_scale, sorted_tok, expert_offset, w_odd, w_odd_scale, y, split */
+        return s.wire({ 0, 1, 2, 3, 4, 5, 6, 7, RAD_FUSE_TMP(0), opt_opd(present, 10) });
+    }
+    case 1: {
+        Step s(out, "swiglu_clamped_had_quant_i8g");
+        s.pint("M", (long long)(M * top_k)).pint("n", (long long)(width / 2))
+         .mirror(p, n_p, "limit").pint("group", R4D_FP8_BLOCK).pstr("dtype", "bf16");
+        return s.wire({ RAD_FUSE_TMP(0), 8, 9, RAD_FUSE_NONE });   /* gate_up, q, scale, out_bf16 */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * gemm_nt_q_dual at i8a8h -- two IQR weights of one activation's codes read in one launch (K-02's
  * q_nope and q_rope). (row: gemm_iqr_dual, M == 1; kernel: libr4d/r4d_gemm_iqr.hip, whose dual
  * GEMV puts the two launches' blocks in one grid at one eight-wave block size, each part doing what

@@ -2303,6 +2303,7 @@ the gather `moe_gather_inv`, which reads the table instead of scanning the sort 
 |---|---|---|
 | `moe_gemm_q` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_odd`/opt `K_odd`/opt `parts`/opt `a_group`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt → `y` |
 | `moe_gemm_q_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `parts`/opt `a_group`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_1`wt, `w_1_scale`wt, `w_2`wt, `w_2_scale`wt, `w_3`wt, `w_3_scale`wt → `y` |
+| `moe_gemm_q_swiglu` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_odd`/opt `K_odd`/opt `parts`/opt `a_group`/opt `limit`:f64 | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt → `q`, `scale`; `split`? |
 | `scale_rows` | `M`(range) `n` `act` `dtype` | `x`, `s`, `add`? → `y` |
 
 The arithmetic is the same whether a kernel is handed the tables or the stacked form
@@ -2347,6 +2348,21 @@ run's remainder of one or two rows past whole 64s keeps its own entry, so the by
 map's. A
 class's rows are whole trellis runs in each part, so a gate_up split in 128-row blocks between
 ranks takes `tcq_rows=128`. The output is the product within f32 rounding.
+
+**`moe_gemm_q_swiglu` is `moe_gemm_q` with `swiglu_clamped_had_quant_i8g` in its epilogue** (K-53).
+Over a two-part gate_up (`parts` 2, gate then up, each n = max(N, N_odd) / 2 columns, a multiple of
+128) its outputs are that op's: the int8 codes of the 128-wide Hadamard of the clamped product
+`silu(min(gate, limit)) * clamp(up, -limit, limit)`, rounded to bf16 once, and an f32 scale per
+(row, 128 columns), so the [T, 2n] gate_up a routed layer writes and reads back is never written.
+There is no `out_bf16`: its consumer is a rotated int8 down projection, which reads the codes. It
+is byte-identical to `moe_gemm_q` followed by `swiglu_clamped_had_quant_i8g`, the chain libr4d's
+row publishes (`replaces`). libr4d's `moe_gemm_iqr_swiglu` serves it for IQR experts on the run
+map's and the packed map's grids only: a block owns one 128-column group of the product, its waves
+take the group's eight gate tiles and then the eight up tiles at the same columns, and the group's
+rows are rotated and quantised once all are staged. It refuses the decode band (`2 T <= 3
+n_expert`, T the routed rows), which is not a band of `M` alone, so an architecture declares it
+from the first `M` past the band and keeps the pair for the heights below
+(`rad_block_moe_fp8.h`).
 
 **`router_sigmoid_topk`** is single-group correction-bias routing, all in f32. The scores are
 `p = sigmoid(logits)`; the selection takes the `top_k` largest `p + bias`, ties to the lower

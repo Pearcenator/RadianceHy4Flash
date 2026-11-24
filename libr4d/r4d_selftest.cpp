@@ -8237,7 +8237,8 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
  * rows are the dropped tail. moe_iqr_case holds the run map's grid against the dense row; here the
  * packed map and the rule must give its bytes. */
 static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
-    if (!sel("moe_gemm_iqr")) return;
+    /* `moe_gemm_iqr_swiglu` alone runs the gate_up cases, whose run map it is checked against */
+    if (!sel("moe_gemm_iqr") && (down || !sel("moe_gemm_iqr_swiglu"))) return;
     const int64_t E = 512, top_k = 10, Tr = Mtok * top_k, drop = 23;
     char nm[200];
     std::snprintf(nm, sizeof nm, "moe_gemm_iqr prefill maps, %s, %lld tokens (%lld rows)",
@@ -8438,6 +8439,121 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
            diff ? std::to_string(diff) + " of " + std::to_string(y.size()) + " elements differ from the run map's, first row " +
                       std::to_string(first / N) + " column " + std::to_string(first % N)
                 : "the run map's bytes");
+    }
+    /* K-53: moe_gemm_iqr_swiglu (the gate_up with swiglu_clamped_had_quant_i8g in its epilogue)
+     * against moe_gemm_iqr's plane quantised by that row, codes and scales byte for byte, on the
+     * run map's grid, the packed map's and the rule's, at a limit that clips and one that does not;
+     * then with `split`; and refused inside the decode band. The odd class is narrower (512 rows
+     * against 768), so each part's last 128 columns are its zero fill, and the dropped slots and
+     * the dropped tail are zero rows: the pair's codes 0 at scale 1 there. */
+    if (!down && sel("moe_gemm_iqr_swiglu")) {
+        const RadKernelInfo* rf = find(pl, "moe_gemm_iqr_swiglu");
+        const RadKernelInfo* sq = find(pl, "swiglu_clamped_had_quant_i8g");
+        const int64_t n = N / 2, ng = n / 128;
+        void* d_q = dalloc((size_t)(Tr * n));
+        void* d_s = dalloc((size_t)(Tr * ng) * 4);
+        const std::string kn = std::string(nm) + ": moe_gemm_iqr_swiglu";
+        if (!rf || !sq || !d_q || !d_s) {
+            ok(kn.c_str(), false, "row absent or hipMalloc failed");
+        } else {
+            std::vector<uint8_t> q0((size_t)(Tr * n)), q1((size_t)(Tr * n));
+            std::vector<float> s0((size_t)(Tr * ng)), s1((size_t)(Tr * ng));
+            const std::vector<uint8_t> qpoison((size_t)(Tr * n), 0x5a);
+            const std::vector<float> spoison((size_t)(Tr * ng), -3.0f);
+            /* the pair over a gate_up plane already in d_y */
+            auto pair = [&](double lim) {
+                std::vector<RadTensor> t2 = { T(d_y, RAD_BF16, { Tr, N }), T(d_q, RAD_I8, { Tr, n }),
+                                              T(d_s, RAD_F32, { Tr, ng }) };
+                std::vector<RadParam> p2 = { PI("M", Tr), PI("n", n), PF("limit", lim),
+                                             PI("group", 128), PS("dtype", "bf16") };
+                RadArgs a2;
+                std::memset(&a2, 0, sizeof(a2));
+                a2.t = t2.data(); a2.n_t = (int)t2.size();
+                a2.p = p2.data(); a2.n_p = (int)p2.size();
+                a2.world_size = 1;
+                const bool fine = sq->launch(&a2, (RadStream) nullptr) == RAD_OK &&
+                                  st_stream_sync(nullptr) == hipSuccess;
+                if (fine) {
+                    st_memcpy(q0.data(), d_q, q0.size(), hipMemcpyDeviceToHost);
+                    st_memcpy(s0.data(), d_s, s0.size() * 4, hipMemcpyDeviceToHost);
+                }
+                return fine;
+            };
+            /* the fused row: moe_gemm_iqr's operands with q and scale for y, `split` after them */
+            auto fused = [&](double lim, int v, int64_t rows, void* cut, int* rc_out) {
+                std::vector<RadTensor> t2(ts.begin(), ts.begin() + 8);
+                t2.push_back(T(d_q, RAD_I8, { rows, n }));
+                t2.push_back(T(d_s, RAD_F32, { rows, ng }));
+                if (cut) t2.push_back(T(cut, RAD_I32, { 1 }));
+                std::vector<RadParam> p2 = ps;
+                p2[0] = PI("M", (rows + top_k - 1) / top_k);
+                p2.push_back(PF("limit", lim));
+                RadArgs a2 = a;
+                a2.t = t2.data(); a2.n_t = (int)t2.size();
+                a2.p = p2.data(); a2.n_p = (int)p2.size();
+                st_memcpy(d_q, qpoison.data(), qpoison.size(), hipMemcpyHostToDevice);
+                st_memcpy(d_s, spoison.data(), spoison.size() * 4, hipMemcpyHostToDevice);
+                pin(v);
+                const int rc = rf->launch(&a2, (RadStream) nullptr);
+                const bool fine = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                pin(0);
+                if (rc_out) *rc_out = rc;
+                if (fine) {
+                    st_memcpy(q1.data(), d_q, q1.size(), hipMemcpyDeviceToHost);
+                    st_memcpy(s1.data(), d_s, s1.size() * 4, hipMemcpyDeviceToHost);
+                }
+                return fine;
+            };
+            auto compare = [&](const std::string& what) {
+                int64_t dq = 0, ds = 0, first = -1;
+                for (size_t i = 0; i < q0.size(); ++i)
+                    if (q0[i] != q1[i]) { if (first < 0) first = (int64_t)i; ++dq; }
+                for (size_t i = 0; i < s0.size(); ++i) ds += std::memcmp(&s0[i], &s1[i], 4) != 0;
+                ok(what.c_str(), dq == 0 && ds == 0,
+                   dq || ds ? std::to_string(dq) + " codes and " + std::to_string(ds) +
+                                  " scales differ, first code row " + std::to_string(first / n) +
+                                  " column " + std::to_string(first % n)
+                            : "the pair's bytes");
+            };
+            for (const double lim : { 0.75, 10.0 }) {
+                st_memcpy(d_y, y0.data(), y0.size() * 2, hipMemcpyHostToDevice);
+                if (!pair(lim)) { ok(kn.c_str(), false, "the pair did not launch"); continue; }
+                for (const int v : { 4, 8, 0 }) {
+                    const std::string what = kn + " (limit " + std::to_string(lim) + ", " +
+                        (v == 4 ? "run map" : v == 8 ? "packed map" : "the rule's map") +
+                        ") is byte-identical to moe_gemm_iqr + swiglu_clamped_had_quant_i8g";
+                    if (!fused(lim, v, Tr, nullptr, nullptr)) { ok(what.c_str(), false, "launch failed"); continue; }
+                    compare(what);
+                }
+            }
+            /* `split`: both sides take the same checkpoint */
+            {
+                const int32_t cut32 = (int32_t)(Mtok / 2 + 3);
+                void* d_c = dalloc(4);
+                st_memcpy(d_c, &cut32, 4, hipMemcpyHostToDevice);
+                std::vector<RadTensor> t2 = ts;
+                t2.push_back(T(d_c, RAD_I32, { 1 }));
+                RadArgs a2 = a;
+                a2.t = t2.data(); a2.n_t = (int)t2.size();
+                st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+                const std::string what = kn + " with split at token " + std::to_string(cut32) +
+                                         " is byte-identical to the pair with it";
+                const bool g_ok = r->launch(&a2, (RadStream) nullptr) == RAD_OK &&
+                                  st_stream_sync(nullptr) == hipSuccess;
+                if (!g_ok || !pair(10.0) || !fused(10.0, 0, Tr, d_c, nullptr))
+                    ok(what.c_str(), false, "launch failed");
+                else
+                    compare(what);
+            }
+            /* inside the decode band (2 T <= 3 n_expert) the fused row refuses: the pair serves */
+            {
+                const int64_t Tb = 3 * E / 2 / top_k * top_k;
+                int rc = RAD_OK;
+                fused(10.0, 0, Tb, nullptr, &rc);
+                ok((kn + " refuses the decode band (" + std::to_string(Tb) + " routed rows)").c_str(),
+                   rc != RAD_OK, "rc=" + std::to_string(rc));
+            }
+        }
     }
     /* `split` (a checkpoint inside the step): with each expert's slots ascending, as the router's
      * stable sort leaves them, the rows of tokens before the split are a run of their own, so they
@@ -38402,7 +38518,7 @@ static void device_phase(const Plugin& pl) {
             { "down, sorted rows, 512:256 x K 256:128", 512, 256, 256, 128, 1, 10, true },
             { "512 experts, down, sorted rows, 256 x K 128", 256, 128, 256, 128, 1, 512, true },
         };
-        if (sel("moe_gemm_iqr")) {
+        if (sel("moe_gemm_iqr") || sel("moe_gemm_iqr_swiglu")) {
             if (!g_case) std::printf("\nthe grouped MoE GEMM over IQR experts, against the dense IQR GEMM\n");
             static const MoeIqrShape kIqr[] = {
                 /* the run-tile grid: a decode step's rows */

@@ -335,6 +335,7 @@ inline bool gather_q8_on() {
 
 /* The G-3 launch fusions (levers-general.md L3), each behind its own switch, on by default:
  * RADIANCE_HY4_FUSE_SWIGLU (the routed arm's clamped SwiGLU with its rotated int8 quantiser),
+ * RADIANCE_HY4_FUSE_GATEUP_SWIGLU (that launch in the routed gate_up's epilogue at prefill, K-53),
  * RADIANCE_HY4_FUSE_EXPAND_QUANT (the expansion with the gate and the quantiser of attn_output's
  * input), RADIANCE_HY4_FUSE_JUNCTION_Q (the junction writes the codes its consumers read),
  * RADIANCE_HY4_FUSE_QPROJ (q_nope and q_rope in one launch: dual_fuse_on below). Off with 0; each

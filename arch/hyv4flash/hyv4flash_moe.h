@@ -200,6 +200,9 @@ struct Ffn {
         /* The clamped SwiGLU and the rotated int8 quantiser its down projection reads in one launch
          * (G-3a; RADIANCE_HY4_FUSE_SWIGLU=0 keeps the pair). */
         c.swiglu_quant_i8 = fuse_on("RADIANCE_HY4_FUSE_SWIGLU") ? 1 : 0;
+        /* ...and at prefill heights that launch folded into the routed gate_up's epilogue, so the
+         * gate_up plane is never written (K-53; RADIANCE_HY4_FUSE_GATEUP_SWIGLU=0 keeps the two). */
+        c.gate_up_swiglu = fuse_on("RADIANCE_HY4_FUSE_GATEUP_SWIGLU") ? 1 : 0;
         c.norm_topk = s.norm_topk;
         c.route_scale = s.route_scale;
         c.n_group = 1;

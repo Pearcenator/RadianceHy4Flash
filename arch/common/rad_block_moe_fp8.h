@@ -201,6 +201,9 @@ struct MoeFP8 {
         /* With `swiglu_limit`: the same for the rotated int8 codes of an int8 / IQR down projection
          * (GateQuantFP8::fuse_clamped_i8, swiglu_clamped_had_quant_i8g), the routed arm only. */
         int     swiglu_quant_i8 = 0;
+        /* With `swiglu_quant_i8`: at prefill heights the routed gate_up and that quantiser as one
+         * launch (moe_gemm_q_swiglu, K-53), so the gate_up plane is not written and read back. */
+        int     gate_up_swiglu = 0;
         /* A shared arm without its sigmoid gate: the gate plane is filled with 1. */
         int     shared_ungated = 0;
         /* At TP1 the caller may fill the ungated arm's ones plane once for the whole step,
@@ -435,6 +438,10 @@ struct MoeFP8 {
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
     rad_op op_gu = 0, op_dn = 0, op_gather = 0;
+    /* The routed gate_up with its clamped SwiGLU quantiser in the epilogue (Config::gate_up_swiglu),
+     * and the first pass height it serves; 0 where the pair runs at every height. */
+    rad_op  op_gu_sw = 0;
+    int64_t gu_sw_lo = 0;
     /* The routed arm's activations are int8: rotated codes with an f32 scale per (row, group),
      * which the grouped GEMMs meet with the iu8 WMMA (the `a8i8` and `i8a8h` dtypes). The
      * architecture asks for it by feeding `Wire::eff` int8 (ActFP8::q8_fed with q8_rot); int8
@@ -1359,6 +1366,33 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, down_eff, c.n_ff_exp, gact, c.rows * c.top_k,
                                 false, rot && (!a8 || down_codebook_fp8), c.swiglu_limit,
                                 c.swiglu_step != 0));
+    /* K-53: the gate_up and its quantiser in one launch where the quantiser is the rotated int8
+     * swiglu_clamped_had_quant_i8g writing codes alone, over two int8 classes, and a loaded
+     * library declares moe_gemm_q_swiglu: its epilogue is that quantiser over the tiles it has just
+     * rounded to bf16, byte-identical to the pair. libr4d serves it on the map grids alone, past
+     * r4d_moe.hip's decode band (2 T <= 3 n_expert, T = M * top_k routed rows), so it is declared
+     * from the first M past the band and the pair, still declared, serves the heights below. */
+    op_gu_sw = 0;
+    gu_sw_lo = 0;
+    if (c.gate_up_swiglu && gq_exp.clamped_fused && gq_exp.a.q8_fed && gq_exp.a.q8_rot &&
+        !gq_exp.want_x && a8 && ncls == 2 && gu == 2 && !c.expert_bf16 && c.swiglu_limit > 0 &&
+        rad_op_declared(b, "moe_gemm_q_swiglu")) {
+        const int64_t lo = 3 * n_reg / (2 * c.top_k) + 1;
+        if (lo <= c.rows) {
+            const std::vector<rad_weight> tab = tables(w_gu, w_gus);
+            const RadParam ps[] = { RAD_RANGE("M", lo, c.rows), RAD_INT("N", gu * wq[0]),
+                                    RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                    RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
+                                    RAD_STR("a_order", "token"), RAD_STR("dtype", edtype[0]),
+                                    RAD_INT("N_odd", gu * wq[1]), RAD_INT("K_odd", g.n_embd),
+                                    RAD_INT("parts", gu), RAD_INT("a_group", gin_g),
+                                    RAD_F64("limit", c.swiglu_limit) };
+            op_gu_sw = rw(b, rad_decl_op(b, "moe_gemm_q_swiglu", ps, (int)(sizeof ps / sizeof *ps),
+                                         tab.data(), (int)tab.size()),
+                          {gin_q, gin_s, w.sorted, w.eoff}, {gq_exp.a.cq(), gq_exp.a.cs()});
+            if (op_gu_sw) gu_sw_lo = lo;
+        }
+    }
     {
         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
         const RadParam p4[] = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
@@ -1978,6 +2012,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
+    /* K-53's one launch (declare) from its first height: the codes in place of the gate_up plane */
+    const bool gu_sw = op_gu_sw && rows >= gu_sw_lo;
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
@@ -1994,6 +2030,16 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
             brows(w.egu, rows * k), sp };
         rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    } else if (gu_sw) {
+        /* moe_gemm_q's operands with the quantiser's codes and scales in place of y */
+        const RadOperand o_[] = {
+            brow_slice(gin_q, r0, rows, g.n_embd),
+            brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
+            RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
+            brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k), sp };
+        rad_issue(c_, op_gu_sw, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
     } else {
         /* `split` only where set, so every other step's operand list carries none. */
         const RadOperand o_[] = {
@@ -2008,7 +2054,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
-    gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
+    if (!gu_sw) gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !(op_sh_gated && rows <= sh_gated_rows)) gq_sh.step(c_, w.sgu, T, r0, rows);
     /* The shared arm's down projection in front of the routed down GEMM on a step of
      * [sh_down_first_lo, sh_down_first_hi] rows. Behind it (below) the two still run together,

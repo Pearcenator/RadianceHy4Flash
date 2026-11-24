@@ -129,7 +129,8 @@ struct G3Env {
     G3Env() {
         if (g3_fusions) return;
         for (const char* k : { "RADIANCE_HY4_FUSE_SWIGLU", "RADIANCE_HY4_FUSE_EXPAND_QUANT",
-                               "RADIANCE_HY4_FUSE_JUNCTION_Q", "RADIANCE_HY4_FUSE_QPROJ" })
+                               "RADIANCE_HY4_FUSE_JUNCTION_Q", "RADIANCE_HY4_FUSE_QPROJ",
+                               "RADIANCE_HY4_FUSE_GATEUP_SWIGLU" })
             if (!std::getenv(k)) { setenv(k, "0", 1); set.push_back(k); }
     }
     ~G3Env() { for (const char* k : set) unsetenv(k); }
@@ -1467,6 +1468,80 @@ std::vector<std::string> g_undecl;
 void undeclaring_encs(RadBuilder* b) {
     bf16_encs(b);
     for (const std::string& op : g_undecl) b->undeclared.insert(op);
+}
+
+/* K-53: with the G-3 fusions on, the IQR routed arm declares moe_gemm_q_swiglu -- the gate_up with
+ * swiglu_clamped_had_quant_i8g in its epilogue -- from the first height past r4d_moe.hip's decode
+ * band (four experts at top_k 2: 2 * 2 M > 3 * 4 from M 4 on), writing the codes and scales the
+ * pair's quantiser writes, and keeps the pair declared. A prefill pass issues the one launch and
+ * neither of the pair; a decode pass the pair. RADIANCE_HY4_FUSE_GATEUP_SWIGLU=0, and an engine
+ * whose libraries do not declare the op, keep the pair at every height. */
+TEST(k53_the_routed_gate_up_folds_its_swiglu_quantiser_at_prefill) {
+    auto iqr = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+    };
+    struct Pass { std::vector<int> dq, pq; bool fused; };
+    const Pass passes[] = { { { 1, 1, 1 }, {}, false }, { {}, { 12 }, true },
+                            { { 1 }, { 10 }, true }, { {}, { 40 }, true } };
+    /* the step reads the model the last declare built, so each graph is stepped before the next */
+    auto issued = [&](RadBuilder& b, bool on) {
+        for (const Pass& ps : passes) {
+            auto k = kit(b, ps.dq, ps.pq, 0);
+            k->b.positions_h = k->pos.data();
+            RadCtx c{ .b = &b, .batch = &k->b };
+            hyv4flash::step(&c, &k->b);
+            CHECK_LINT(b, &c);
+            if (!c.step_fail.empty()) fprintf(stderr, "k53: %s\n", c.step_fail.c_str());
+            CHECK(c.step_fail.empty());
+            const bool f = on && ps.fused;
+            CHECK_EQ(count_issued(b, c, "moe_gemm_q_swiglu"), f ? 2 : 0);
+            CHECK_EQ(count_issued(b, c, "moe_gemm_q"), f ? 2 : 4);   /* gate_up and down */
+            CHECK_EQ(count_issued(b, c, "swiglu_clamped_had_quant_i8g"), f ? 0 : 2);
+        }
+    };
+
+    g3_fusions = true;
+    Declared on(iqr);
+    g3_fusions = false;
+    REQUIRE_EQ(on.rc, RAD_OK);
+    CHECK_EQ(count_op(on.b, "moe_gemm_q_swiglu"), 2);   /* two MoE layers */
+    CHECK_EQ(count_op(on.b, "swiglu_clamped_had_quant_i8g"), 2);
+    const RecOp* f = find_op(on.b, "moe_gemm_q_swiglu");
+    const RecOp* q = find_op(on.b, "swiglu_clamped_had_quant_i8g");
+    REQUIRE(f != nullptr);
+    REQUIRE(q != nullptr);
+    const RecParam* m = param(f, "M");
+    REQUIRE(m != nullptr);
+    CHECK_EQ(m->kind, (int)RAD_P_RANGE);
+    CHECK_EQ(m->ival, 4);
+    CHECK_EQ(pflt(f, "limit"), 10.0);
+    CHECK_EQ(pint(f, "parts"), 2);
+    CHECK_EQ(pstr(f, "dtype"), std::string("i8a8h"));
+    /* the quantiser's codes and scales, and no bf16 product */
+    REQUIRE_EQ(f->writes.size(), (size_t)2);
+    REQUIRE(q->writes.size() >= 2);
+    CHECK_EQ(f->writes[0], q->writes[0]);
+    CHECK_EQ(f->writes[1], q->writes[1]);
+    every_weight_read(on.b);
+    issued(on.b, true);
+
+    for (int how : { 0, 1 }) {
+        g3_fusions = true;
+        if (how == 0) setenv("RADIANCE_HY4_FUSE_GATEUP_SWIGLU", "0", 1);
+        else          g_undecl = { "moe_gemm_q_swiglu" };
+        Declared off(how == 0 ? +iqr : +[](RadBuilder* b) {
+            undeclaring_encs(b);
+            b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true);
+        });
+        g3_fusions = false;
+        unsetenv("RADIANCE_HY4_FUSE_GATEUP_SWIGLU");
+        g_undecl.clear();
+        REQUIRE_EQ(off.rc, RAD_OK);
+        CHECK_EQ(count_op(off.b, "moe_gemm_q_swiglu"), 0);
+        CHECK_EQ(count_op(off.b, "swiglu_clamped_had_quant_i8g"), 2);
+        issued(off.b, false);
+    }
 }
 TEST(the_moe_gather_reads_the_sorts_inverse_table) {
     struct Case {

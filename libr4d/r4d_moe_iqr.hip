@@ -37,6 +37,14 @@
 // The forms built are the computed trellis under one f32 scale a row (TrellisMad, kRowF32), IQR-V4's
 // form for a feed-forward weight: the fold is the block's factor times the activation's scale, one
 // fma a slot, and a row's scale meets its sum once at the store.
+//
+// moe_gemm_q_swiglu (K-53) is the map grid's gate_up with swiglu_clamped_had_quant_i8g in its
+// epilogue, so the [T, 2n] bf16 plane is never written: a block owns one 128-column group of the
+// product, its waves taking the group's eight gate tiles and then the eight matching up tiles (a
+// wave's up tile is at its own gate tile's columns, so a lane meets in LDS the gate values it
+// stored itself), and the group's rows are rotated and quantised once every wave is done. Each
+// tile rounds to the bf16 the plane holds and the product is the quantiser's expression over those
+// bytes, so the codes and scales are the pair's byte for byte (r4d_fuse.cpp's chain).
 
 #include "r4d.h"
 #include "r4d_args.h"
@@ -46,10 +54,13 @@
 #include "r4d_iqr.h"
 #include "r4d_iqr_dec.h"
 #include "r4d_moe_sort.h"
+#include "r4d_q8.h"     // the int8 codes of the swiglu epilogue (moe_gemm_q_swiglu)
+#include "r4d_fwht.h"   // ...and the rotation in front of them
 
 #include <algorithm>
 #include <cstdio>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -219,8 +230,27 @@ __device__ __forceinline__ void dot_run(const Ctx& c, uint32_t rt, uint32_t kph,
     const IqrCls c_1, const IqrCls c_2, const IqrCls c_3, const int32_t* __restrict__ sorted,     \
     const int32_t* __restrict__ off, uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,  \
     uint32_t T, uint32_t fy, uint32_t n_expert, uint32_t inv_k, uint32_t x_ld, uint32_t xs_ld,    \
-    uint32_t y_ld, uint32_t mode, uint32_t run_tiles, uint32_t inv_ft
-template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, bool PK = false>
+    uint32_t y_ld, uint32_t mode, uint32_t run_tiles, uint32_t inv_ft, uint8_t* __restrict__ Q8, \
+    float* __restrict__ QS, uint32_t q_ld, uint32_t s_ld, float lim
+
+/* swiglu_clamped's product of one bf16 gate and up value, as gated_quant_fp8_body's ACT 3 forms it
+ * (r4d_fused_quant_fp8.hip): the gate clipped above, the up both ways, the product rounded once. */
+__device__ __forceinline__ uint32_t swiglu_bf16(uint32_t gb, uint32_t ub, float lim) {
+    const float g = fminf(bf16_to_f32((uint16_t)gb), lim);
+    const float u = fminf(fmaxf(bf16_to_f32((uint16_t)ub), -lim), lim);
+    return f32_to_bf16((g / (1.0f + expf(-g))) * u);
+}
+/* ...of a word of two bf16 gate values and the word of the two up values at the same columns. */
+__device__ __forceinline__ uint32_t swiglu_bf16x2(uint32_t g2, uint32_t u2, float lim) {
+    return swiglu_bf16(g2 & 0xffffu, u2 & 0xffffu, lim) |
+           swiglu_bf16(g2 >> 16, u2 >> 16, lim) << 16;
+}
+
+/* SW: moe_gemm_q_swiglu's form (the map grid, a wave a weight tile down all of its K, four waves
+ * and four tiles a wave: a block's sixteen tiles are its 128-column group's gate and up). Y is
+ * unused; Q8 / QS receive the codes and scales at `q_ld` bytes and `s_ld` floats a row. */
+template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, bool PK = false,
+          bool SW = false>
 __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     using D = Dec<F>;
     static_assert(D::MAD && F::SC == kRowF32 && F::LRB == 0,
@@ -229,6 +259,8 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
                   "several token tiles a block: the run map's grid, a wave a weight tile");
     static_assert(TPW == 1u || KW == 1u, "several weight tiles a wave: a wave a tile's whole K");
     static_assert(!PK || MAP, "packed entries: the run map's grid");
+    static_assert(!SW || (MAP && KW == 1u && RTB == 4u && TPW == 4u),
+                  "the swiglu epilogue: a block's four waves take a 128-column group's sixteen tiles");
     constexpr uint32_t NW = KW * RTB, NTHR = NW * kWave, kCols = RTB * TPW * 16u;
     /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift, bit 3 the activation's scale per 256 of
      * K, bits 8+ `parts` (r4d_moe.hip's). */
@@ -238,6 +270,9 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     __shared__ __attribute__((aligned(16))) uint8_t s_tr[NW * kTrBytes];
     static_assert(8u * kWave * 4u <= kTrBytes, "a wave's partials in its transpose tile");
     __shared__ uint32_t s_sel[4];
+    /* SW: the group's 128 columns of each of the block's rows, the gate's bf16 bytes and then the
+     * product over them (32 KiB at eight token tiles) */
+    __shared__ __attribute__((aligned(16))) uint16_t s_h[SW ? NT * kRows * 128u : 1u];
     auto red = [&](uint32_t w) { return (float*)(s_tr + w * kTrBytes); };
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave = __builtin_amdgcn_readfirstlane(tid / kWave);
@@ -250,12 +285,39 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
 
     /* ---- the block's run: expert e, sorted rows [rs, re). */
     uint32_t e, rs, re;
+    /* SW: rows [rs, rs + nr) of the staged product, rotated and quantised as
+     * swiglu_clamped_had_quant_i8g's pass does a 128-column group (a wave a row here, a wave a
+     * group there: the same lane mapping, four consecutive columns a lane), into group
+     * blockIdx.y of their codes and scales. */
+    auto quant_rows = [&](uint32_t nr) {
+        __syncthreads();
+        for (uint32_t r = wave; r < nr; r += NW) {
+            float v[4];
+#pragma unroll
+            for (uint32_t j = 0; j < 4; ++j) v[j] = bf16_to_f32(s_h[r * 128u + lane * 4u + j]);
+            r4d_fwht_wave<128>(v, (int)lane);
+            float m = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+            m = r4d_wave_max(m);
+            const float sc = m > 0.0f ? m * (1.0f / q8_top<true>()) : 1.0f;
+            if (lane == 0) QS[(size_t)(rs + r) * s_ld + blockIdx.y] = sc;
+            const float inv = 1.0f / sc;
+            *(uint32_t*)(Q8 + (size_t)(rs + r) * q_ld + blockIdx.y * 128u + lane * 4u) =
+                q8_pack4<true>(v[0], v[1], v[2], v[3], inv);
+        }
+    };
     if constexpr (MAP) {
         if (blockIdx.x >= map[0]) return;
         e = map[1 + 2 * blockIdx.x];
         rs = map[2 + 2 * blockIdx.x];
         if (e == kTail) {
-            zero_rows(rs, rs + kRows * NT < T ? rs + kRows * NT : T);
+            const uint32_t rz = rs + kRows * NT < T ? rs + kRows * NT : T;
+            if constexpr (SW) {
+                /* the pair's dropped rows: a zero plane, whose product is zero */
+                for (uint32_t x = tid; x < (rz - rs) * 128u; x += NTHR) s_h[x] = 0;
+                quant_rows(rz - rs);
+            } else {
+                zero_rows(rs, rz);
+            }
             return;
         }
         if constexpr (PK) {
@@ -403,6 +465,8 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     const uint32_t part = inv_ft ? __umulhi(ty, inv_ft) : 0u, tin = ty - part * ft;
     const bool pad = tin * 16u >= fc;
     const uint32_t rt = part * (fc / 16u) + tin, row0 = rt * 16u;
+    /* SW: the tile's first column in the block's group */
+    const uint32_t hc0 = tin * 16u - blockIdx.y * 128u;
 
     /* ---- a run of one or two rows: the dot path, no tile. */
     if (dot) {
@@ -424,9 +488,15 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             for (uint32_t w = 0; w < KW; ++w) o += red(rtb * KW + w)[lane];
         }
         const uint32_t m = lane >> 4, q = red16_row(lane);
-        if (m < nrows)
-            Y[(size_t)(rs + m) * y_ld + part * fy + tin * 16u + q] =
-                f32_to_bf16(!pad && dok[m] ? o * row_scale<F>(c, row0 + q) : 0.0f);
+        if (m < nrows) {
+            const uint16_t yb = f32_to_bf16(!pad && dok[m] ? o * row_scale<F>(c, row0 + q) : 0.0f);
+            if constexpr (SW) {
+                uint16_t& h = s_h[m * 128u + hc0 + q];
+                h = part == 0u ? yb : (uint16_t)swiglu_bf16(h, yb, lim);
+            } else {
+                Y[(size_t)(rs + m) * y_ld + part * fy + tin * 16u + q] = yb;
+            }
+        }
         return;
     }
 
@@ -535,29 +605,49 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             else              okj = okr[j];
 #pragma unroll
             for (uint32_t t = 0; t < 8; ++t) v[t] = okj ? out[j][t] * rsc[t] : 0.0f;
-            *(uint4*)(Y + (size_t)(rs + rj) * y_ld + part * fy + tin * 16u + a0) =
-                make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
-                           bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
+            const uint4 yb = make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
+                                        bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
+            if constexpr (SW) {
+                /* the gate's bytes, then the product over them at the up tile, by this lane */
+                uint4* h = (uint4*)(s_h + rj * 128u + hc0 + a0);
+                if (part == 0u) {
+                    *h = yb;
+                } else {
+                    const uint4 gb = *h;
+                    *h = make_uint4(swiglu_bf16x2(gb.x, yb.x, lim), swiglu_bf16x2(gb.y, yb.y, lim),
+                                    swiglu_bf16x2(gb.z, yb.z, lim), swiglu_bf16x2(gb.w, yb.w, lim));
+                }
+            } else {
+                *(uint4*)(Y + (size_t)(rs + rj) * y_ld + part * fy + tin * 16u + a0) = yb;
+            }
         }
     }
     };
     /* A wave whose tile is all of its K (KW 1) takes TPW tiles in turn: the run search and the
      * rows above are paid once for them, which a narrow-K projection (two or three units a tile)
      * otherwise pays as a third of its work. */
-    for (uint32_t tw = 0; tw < TPW; ++tw) tile((blockIdx.y * RTB + rtb) * TPW + tw);
+    if constexpr (SW) {
+        /* group blockIdx.y: turns 0 and 1 its gate tiles, 2 and 3 the up tiles at the same
+         * columns (part 1), so a wave's up tile is its own gate tile's columns */
+        for (uint32_t tw = 0; tw < TPW; ++tw)
+            tile((tw >> 1) * ft + blockIdx.y * 8u + (tw & 1u) * RTB + rtb);
+        quant_rows(nrows);
+    } else {
+        for (uint32_t tw = 0; tw < TPW; ++tw) tile((blockIdx.y * RTB + rtb) * TPW + tw);
+    }
 }
 
 /* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
  * chained form (r4d_chain.h), every block waiting before its first read and adding once after
  * its last write. Eight token tiles a block hold 237 registers: six waves a SIMD. */
 template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, class CH,
-          bool PK = false>
+          bool PK = false, bool SW = false>
 __global__ __launch_bounds__(KW * RTB * kWave) R4D_WAVES(NT > 4u ? 6 : 8)
 void moe_iqr_kernel(R4D_MOEIQR_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK>(X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy,
-                                           n_expert, inv_k, x_ld, xs_ld, y_ld, mode, run_tiles,
-                                           inv_ft);
+    moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK, SW>(X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T,
+                                               fy, n_expert, inv_k, x_ld, xs_ld, y_ld, mode,
+                                               run_tiles, inv_ft, Q8, QS, q_ld, s_ld, lim);
     if (CH::on) r4d_chain_done();
 }
 #undef R4D_MOEIQR_PARAMS
@@ -742,6 +832,12 @@ struct Launch {
     uint32_t gx, nkb;
     bool packed;  /* the map is the packed one, at kPackTiles token tiles a block */
     bool chain;   /* the chained form (r4d_chain.h) */
+    /* moe_gemm_q_swiglu: the codes and scales in place of y, a block a 128-column group */
+    bool sw;
+    uint8_t* q8;
+    float* qs;
+    uint32_t q_ld, s_ld;
+    float lim;
 };
 
 /* The packed map's entry bound: an expert one entry per 128 rows begun and one for its dot
@@ -763,7 +859,7 @@ int launch_form(const Launch& g, RadStream stream) {
                   dim3(g.gx, g.N / (16u * rtb_ * tpw_)), dim3(kw_ * rtb_ * kWave), 0, g.x, g.xs,  \
                   g.c[0], g.c[1], g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map,   \
                   g.T, g.N / (g.mode >> 8), g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld, g.mode, \
-                  g.run_tiles, g.inv_ft)
+                  g.run_tiles, g.inv_ft, g.q8, g.qs, g.q_ld, g.s_ld, g.lim)
 #define R4D_MOEIQR_GO(kw_, rtb_, map_, nt_, tpw_)                                                 \
     do { if (g.chain) R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, r4dchain);                         \
          else         R4D_MOEIQR_E(kw_, rtb_, map_, nt_, tpw_, R4dUnchained); } while (0)
@@ -775,6 +871,22 @@ int launch_form(const Launch& g, RadStream stream) {
     const bool wide_k = g.nkb >= 8u && (g.T < kOneWaveMinRows || (g.N / 16u) % 4u);
     const bool two = !wide_k && g.nkb < 8u && g.N % (16u * 8u) == 0u &&
                      g.T >= kTwoTileMinRows && g.T <= kTwoTileMaxRows;
+#define R4D_MOEIQR_SW(nt_, pk_)                                                                   \
+    rc = R4D_EMIT(stream, (moe_iqr_kernel<F, 1u, 4u, true, nt_, 4u, R4dUnchained, pk_, true>),    \
+                  dim3(g.gx, g.N / 2u / 128u), dim3(4u * kWave), 0, g.x, g.xs, g.c[0], g.c[1],    \
+                  g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map, g.T, g.N / 2u,    \
+                  g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld, g.mode, g.run_tiles, g.inv_ft,    \
+                  g.q8, g.qs, g.q_ld, g.s_ld, g.lim)
+    if (g.sw) {
+        /* moe_gemm_q_swiglu: the map's grids only (moe_iqr_launch refuses the decode band), a
+         * block a 128-column group of the product */
+        rc = R4D_NO(RAD_E_UNSUPPORTED);
+        if (!g.map) return rc;
+        if (!g.packed) R4D_MOEIQR_SW(kMapTiles, false);
+        else if constexpr (F::B == 4 && F::L == 16) R4D_MOEIQR_SW(kPackTiles, true);
+        return rc;
+    }
+#undef R4D_MOEIQR_SW
     if (g.map && g.packed) {
         /* the packed map's grid, the one form built with it (see moe_iqr_launch) */
         rc = R4D_NO(RAD_E_UNSUPPORTED);
@@ -783,7 +895,7 @@ int launch_form(const Launch& g, RadStream stream) {
                           dim3(g.gx, g.N / 64u), dim3(4u * kWave), 0, g.x, g.xs, g.c[0], g.c[1],
                           g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map, g.T,
                           g.N / (g.mode >> 8), g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld, g.mode,
-                          g.run_tiles, g.inv_ft);
+                          g.run_tiles, g.inv_ft, g.q8, g.qs, g.q_ld, g.s_ld, g.lim);
     }
     else if (g.map)                R4D_MOEIQR_GO(1u, 4u, true, kMapTiles, 1u);
     else if (wide_k)               R4D_MOEIQR_GO(4u, 1u, false, 1u, 1u);
@@ -795,9 +907,11 @@ int launch_form(const Launch& g, RadStream stream) {
 }
 
 /* moe_gemm_q's operands (r4d_moe.hip's moe_gemm_launch): [0] a [1] a_scale [2] w [3] w_scale
- * [4] sorted [5] off, then the further classes' tables and y. */
-int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
+ * [4] sorted [5] off, then the further classes' tables and y. `sw`: moe_gemm_q_swiglu's, two
+ * classes, [8] q and [9] scale in place of y, [10] split. */
+int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls, bool sw = false) {
     if (ncls != 2 && ncls != 4) return R4D_NO(RAD_E_INVAL);
+    if (sw && ncls != 2) return R4D_NO(RAD_E_INVAL);
     const RadTensor* Aq     = r4d_opt(a, 0);
     const RadTensor* As     = r4d_opt(a, 1);
     const RadTensor* sorted = r4d_opt(a, 4);
@@ -808,12 +922,15 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
     const RadTensor* Wsc[4] = { r4d_opt(a, 3), r4d_opt(a, 7),
                                 ncls == 4 ? r4d_opt(a, 9) : nullptr,
                                 ncls == 4 ? r4d_opt(a, 11) : nullptr };
-    const RadTensor* Y      = r4d_opt(a, ncls == 4 ? 12 : 8);
+    const RadTensor* Y      = sw ? nullptr : r4d_opt(a, ncls == 4 ? 12 : 8);
+    const RadTensor* Qc     = sw ? r4d_opt(a, 8) : nullptr;
+    const RadTensor* Qs     = sw ? r4d_opt(a, 9) : nullptr;
     /* `split` (optional, after y): a checkpoint inside the step -- the token at which each expert's
      * run is cut in two for the map (moe_iqr_packmap_kernel). */
-    const RadTensor* split  = r4d_opt(a, ncls == 4 ? 13 : 9);
-    if (!Aq || !As || !sorted || !off || !Y) return R4D_NO(RAD_E_INVAL);
-    if (!Aq->data || !As->data || !sorted->data || !off->data || !Y->data)
+    const RadTensor* split  = r4d_opt(a, sw ? 10 : ncls == 4 ? 13 : 9);
+    if (!Aq || !As || !sorted || !off || (sw ? !Qc || !Qs : !Y)) return R4D_NO(RAD_E_INVAL);
+    if (!Aq->data || !As->data || !sorted->data || !off->data ||
+        (sw ? !Qc->data || !Qs->data : !Y->data))
         return R4D_NO(RAD_E_INVAL);
 
     static const char* const kNk[4][2] = { { "N", "K" }, { "N_1", "K_1" }, { "N_2", "K_2" },
@@ -870,13 +987,33 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
         if (Kc[q] > K) K = Kc[q];
     }
     for (int q = ncls; q < 4; ++q) g.c[q] = g.c[0];
-    if (Aq->dtype != RAD_I8 || As->dtype != RAD_F32 || Y->dtype != RAD_BF16 ||
+    if (Aq->dtype != RAD_I8 || As->dtype != RAD_F32 ||
+        (sw ? Qc->dtype != RAD_I8 || Qs->dtype != RAD_F32 : Y->dtype != RAD_BF16) ||
         sorted->dtype != RAD_I32 || off->dtype != RAD_I32)
         return R4D_NO(RAD_E_DTYPE);
 
     long long T = 0, M = 0, Ms = 0;
-    const long long y_ld = r4d_rows_pitch(Y, N, &T);
-    if (y_ld < 0 || T <= 0) return R4D_NO(RAD_E_STRIDE);
+    long long y_ld = 0, q_ld = 0, s_ld = 0;
+    if (sw) {
+        /* swiglu_clamped_had_quant_i8g over the [T, N] gate_up: gate and up the two parts, n = N / 2
+         * whole 128-column groups, a positive finite limit (its launcher's terms) */
+        const double lim = r4d_getf(a, "limit", 0.0);
+        if (parts != 2 || (N / 2) % (long long)kBlock) return R4D_NO(RAD_E_SHAPE);
+        if (!(lim > 0.0) || !std::isfinite((float)lim)) return R4D_NO(RAD_E_INVAL);
+        long long Ts = 0;
+        q_ld = r4d_rows_pitch(Qc, N / 2, &T);
+        s_ld = r4d_rows_pitch(Qs, N / 2 / (long long)kBlock, &Ts);
+        if (q_ld < 0 || s_ld < 0 || T <= 0 || Ts != T) return R4D_NO(RAD_E_STRIDE);
+        g.q8 = (uint8_t*)Qc->data;
+        g.qs = (float*)Qs->data;
+        g.q_ld = (uint32_t)q_ld;
+        g.s_ld = (uint32_t)s_ld;
+        g.lim = (float)lim;
+        g.sw = true;
+    } else {
+        y_ld = r4d_rows_pitch(Y, N, &T);
+        if (y_ld < 0 || T <= 0) return R4D_NO(RAD_E_STRIDE);
+    }
     const long long a_ld = r4d_rows_pitch(Aq, K, &M);
     if (a_ld < 0 || M <= 0) return R4D_NO(RAD_E_STRIDE);
     const long long as_ld = r4d_rows_pitch(As, K / a_group, &Ms);
@@ -889,13 +1026,15 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
 
     g.nkb = (uint32_t)(K / kBlock);
     const bool band = r4d_moe_in_decode_band(T, n_expert);
+    /* the swiglu epilogue is the map grid's: the decode band issues the pair */
+    if (sw && band) return R4D_NO(RAD_E_UNSUPPORTED);
     /* a narrow-K projection and the run map's grid take four weight tiles a block */
     if (((!band || g.nkb < 8u) && (N / 16) % 4) || (N / parts) % 16) return R4D_NO(RAD_E_SHAPE);
     g.x = (const int8_t*)Aq->data;
     g.xs = (const float*)As->data;
     g.sorted = (const int32_t*)sorted->data;
     g.off = (const int32_t*)off->data;
-    g.y = (uint16_t*)Y->data;
+    g.y = sw ? nullptr : (uint16_t*)Y->data;
     g.T = (uint32_t)T;
     g.N = (uint32_t)N;
     g.n_expert = (uint32_t)n_expert;
@@ -987,6 +1126,9 @@ extern "C" int r4d_rad_moe_gemm_iqr(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_moe_gemm_iqr_mod4(const RadArgs* a, RadStream s) {
     return moe_iqr_launch(a, s, 4);
+}
+extern "C" int r4d_rad_moe_gemm_iqr_swiglu(const RadArgs* a, RadStream s) {
+    return moe_iqr_launch(a, s, 2, true);
 }
 extern "C" int64_t r4d_rad_moe_gemm_iqr_scratch(const RadArgs* a) { return moe_iqr_scratch(a); }
 /* Pins the prefill map's token tiles of moe_gemm_iqr for tests: 4 the run map, 8 the packed map,
