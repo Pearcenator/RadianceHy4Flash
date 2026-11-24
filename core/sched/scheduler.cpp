@@ -2470,13 +2470,24 @@ const RadBatch* Scheduler::step() {
     struct LoneReset { bool& f; ~LoneReset() { f = false; } } lone_reset{lone_now_};
     /* The running request a spanned step holds, or -1: every other running request sits it out. */
     int32_t span_slot = -1;
+    /* One prefill alone (nothing else runs or can be admitted): with set_ckpt_inside its tail
+     * snapshot goes inside its last chunk (plan_chunk), with or without a span. */
+    const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                (int64_t)running_.size() < cfg_.max_seqs;
+    auto one_prefill_alone = [&]() -> bool {
+        if (running_.size() == 1 && !admit_possible) {
+            const SchedReq& sr = *reqs_[(size_t)running_[0]];
+            const Request& rr = *sr.req;
+            return !(rr.n_computed >= (int64_t)rr.prompt.size() &&
+                     rr.n_computed + 1 >= sr.seq_len());   /* not a decode row */
+        }
+        return running_.empty() && waiting_.size() == 1;
+    };
     /* Keyed on the flag, not on whether this model has intervals to span: the engine told the
      * plugin that a step wider than shared_tok is one sequence (RadBuildCtx::max_mixed_tok),
      * whatever the geometry turned out to be. */
     if (cfg_.prefill_span > 1) {
         bool lone = false;
-        const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
-                                    (int64_t)running_.size() < cfg_.max_seqs;
         const bool after_finish = finished_beside_;
         finished_beside_ = false;
         if (!running_.empty() && !admit_possible && !after_finish) {
@@ -2504,20 +2515,13 @@ const RadBatch* Scheduler::step() {
             lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
         }
         span_now_ = lone;
-        if (!lone) budget = geo_.shared_tok;
-    } else if (ckpt_inside_) {
-        /* Without a span a step holds one prefill alone only where nothing else runs or can be
-         * admitted: then its tail snapshot goes inside its last chunk (plan_chunk). */
-        const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
-                                    (int64_t)running_.size() < cfg_.max_seqs;
-        if (running_.size() == 1 && !admit_possible) {
-            const SchedReq& sr = *reqs_[(size_t)running_[0]];
-            const Request& rr = *sr.req;
-            lone_now_ = !(rr.n_computed >= (int64_t)rr.prompt.size() &&
-                          rr.n_computed + 1 >= sr.seq_len());   /* not a decode row */
-        } else if (running_.empty() && waiting_.size() == 1) {
-            lone_now_ = true;
+        if (!lone) {
+            budget = geo_.shared_tok;
+            /* A prompt under set_span_min's length, alone: no span, but its tail goes inside. */
+            lone_now_ = ckpt_inside_ && !after_finish && one_prefill_alone();
         }
+    } else if (ckpt_inside_) {
+        lone_now_ = one_prefill_alone();
     }
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its

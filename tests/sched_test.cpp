@@ -904,6 +904,49 @@ TEST(a_lone_prefill_without_a_span_takes_its_tail_snapshot_inside_its_last_chunk
     CHECK_EQ(b_ck, 2368);
 }
 
+/* X-02 under a span with a shortest spanning prefill (set_span_min), as served: a prompt shorter
+ * than it runs alone without a span, at the shared budget, and still takes its tail snapshot
+ * inside its last chunk with the batch cut there. Beside a second request it keeps the cut. */
+TEST(a_lone_prompt_under_the_span_min_takes_its_tail_snapshot_inside_too) {
+    auto run = [](bool second, std::vector<int64_t>* cks, int* cut_rows, int* wide) {
+        Fixture f;
+        f.build(4096, 64, 2048);
+        f.cfg.checkpoint_interval = 1024;
+        f.cfg.prefill_span = 2;
+        CHECK_OK(f.start());
+        f.sch.set_span_min(8192);
+        f.sch.set_ckpt_inside(true);
+        const uint64_t a = f.submit(2400, 2);
+        if (second) f.submit(100, 40);
+        for (int k = 0; k < 40; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq != a || !e.is_prefill) continue;
+                *wide += e.n_tokens > 1024;
+                if (e.ckpt_tok >= 0) cks->push_back(e.ctx_len + e.ckpt_tok + 1);
+                if (e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) {
+                    CHECK_EQ(f.sch.plan().e.size(), (size_t)1);
+                    CHECK_EQ(b->ckpt_cut, e.ckpt_tok + 1);
+                    *cut_rows = b->ckpt_cut;
+                }
+            }
+            if (second) CHECK_EQ(b->ckpt_cut, 0);
+            f.commit_plain();
+        }
+    };
+    std::vector<int64_t> k1, k2;
+    int cut1 = 0, cut2 = 0, wide1 = 0, wide2 = 0;
+    run(false, &k1, &cut1, &wide1);
+    CHECK(k1 == std::vector<int64_t>({ 1024, 2048, 2368 }));
+    CHECK_EQ(cut1, 320);                  /* [2048, 2400) cut at 2368 */
+    CHECK_EQ(wide1, 0);                   /* no span: every chunk at most an interval */
+    run(true, &k2, &cut2, &wide2);
+    CHECK(k2 == std::vector<int64_t>({ 1024, 2048, 2368 }));
+    CHECK_EQ(cut2, 0);
+    CHECK_EQ(wide2, 0);
+}
+
 /* X-02: several prompts, one of which ends in a lone spanned step with its tail snapshot inside it,
  * while the next step (its first decode row beside the other prompt's chunk, and later a decoder)
  * is issued ahead. The step with the snapshot inside holds that one sequence and is cut there; the
