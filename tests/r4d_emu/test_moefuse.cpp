@@ -451,6 +451,114 @@ void gather_inverse_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* moe_gather's sixteen-slot form (gather_kernel16, r4d_moe_gather.h): top_k = 16 with eight
+ * columns a lane, one sixteen-byte load a slot, against the scalar form's sums -- the same table
+ * from the inverse and the same self-scan from `sorted`, at Hy4-flash's decode heights (one row,
+ * the c8 verify's 32, and past the self-scan bound), f32 routing weights and bf16, the ungated
+ * shared arm, a sigmoid-gated one and none, and a slice that drops slots. */
+struct SixteenShape {
+    int M, n, nl, base;
+    bool f32w; /* Hy4-flash's f32 routing weights, else bf16 */
+    int shared; /* 0 none, 1 the ungated arm, 2 a sigmoid gate */
+};
+void gather_sixteen_cases(std::mt19937& rng, int& cases, int& fails) {
+    const SixteenShape shapes[] = {
+        { 1, 2560, 288, 0, true, 0 },  { 1, 2560, 288, 0, true, 1 }, { 8, 2560, 288, 0, true, 2 },
+        { 32, 2560, 288, 0, true, 1 }, { 32, 3072, 288, 0, false, 0 }, { 40, 2560, 288, 0, true, 1 },
+        { 64, 2560, 288, 0, true, 2 }, { 33, 512, 144, 0, true, 1 },  { 48, 256, 96, 96, false, 0 },
+        { 2, 4096, 288, 0, true, 0 },
+    };
+    const int k = 16, ne = 288;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (const SixteenShape& sh : shapes) {
+        const int M = sh.M, n = sh.n, T = M * k, nl = sh.nl;
+        std::vector<int32_t> ids((size_t)T);
+        for (int r = 0; r < M; ++r) {
+            std::vector<int32_t> pool(ne);
+            for (int e = 0; e < ne; ++e) pool[(size_t)e] = e;
+            std::shuffle(pool.begin(), pool.end(), rng);
+            for (int j = 0; j < k; ++j) ids[(size_t)(r * k + j)] = pool[(size_t)j];
+        }
+        Scatter plain = scatter_kernel(ids, nl, sh.base, nullptr, false);
+        Scatter inv = scatter_kernel(ids, nl, sh.base, nullptr, true);
+        ++cases;
+        if (plain.rc != RAD_OK || inv.rc != RAD_OK || inv.inv != inverse_of(plain.sorted)) {
+            std::printf("FAIL moe_gather's sixteen-slot form: the inverse at M=%d slice %d+%d\n", M,
+                        sh.base, nl);
+            ++fails;
+            continue;
+        }
+        /* The form reads a row as one sixteen-byte load: every pitch a multiple of eight and the
+         * rows sixteen-byte aligned, which the launcher checks before it takes the form. */
+        const int ye_ld = n + 8, ew_ld = k + 2, y_ld = n + 8, sh_ld = n + 8, sg_ld = 2;
+        std::vector<uint16_t> ye((size_t)T * ye_ld), shp((size_t)M * sh_ld), sg((size_t)M * sg_ld);
+        std::vector<float> ewf((size_t)M * ew_ld);
+        std::vector<uint16_t> ewb((size_t)M * ew_ld);
+        if (((uintptr_t)ye.data() | (uintptr_t)shp.data() | (uintptr_t)ewf.data()) % 16 != 0) {
+            std::printf("FAIL moe_gather's sixteen-slot form: unaligned buffers at M=%d\n", M);
+            ++fails;
+            continue;
+        }
+        for (auto& v : ye) v = f2b(nd(rng));
+        for (auto& v : shp) v = f2b(nd(rng));
+        for (size_t i = 0; i < sg.size(); ++i) sg[i] = sh.shared == 1 ? f2b(1.f) : f2b(nd(rng));
+        for (size_t i = 0; i < ewf.size(); ++i) {
+            ewf[i] = std::fabs(nd(rng)) * 0.3f;
+            ewb[i] = f2b(ewf[i]);
+        }
+        const void* ew = sh.f32w ? (const void*)ewf.data() : (const void*)ewb.data();
+        const uint16_t* shv = sh.shared ? shp.data() : nullptr;
+        const uint16_t* sgv = sh.shared ? sg.data() : nullptr;
+        const int sig = sh.shared == 2;
+        const unsigned gy1 = (unsigned)((n + 255) / 256);
+        const int kcols = (int)r4d_moegather::kGatherCols;
+        const unsigned gy8 = (unsigned)((n + 256 * kcols - 1) / (256 * kcols));
+        auto gather = [&](const int32_t* tab, const int32_t* sorted, bool cols,
+                          std::vector<uint16_t>& y) {
+            y.assign((size_t)M * y_ld, kGatePoison);
+            const dim3 grid((unsigned)M, cols ? gy8 : gy1);
+#define R4D_EMU_GATHER(K)                                                                          \
+    R4D_EMIT(nullptr, (K), grid, dim3(256), 0, ye.data(), ew, tab, y.data(), (uint32_t)M,          \
+             (uint32_t)n, (uint32_t)k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, sorted,   \
+             (uint32_t)T, shv, sgv, (uint32_t)sh_ld, (uint32_t)sg_ld, sig)
+            if (cols) {
+                if (sh.f32w) R4D_EMU_GATHER((r4d_moegather::gather_kernel16<256, true>));
+                else R4D_EMU_GATHER((r4d_moegather::gather_kernel16<256, false>));
+            } else {
+                if (sh.f32w) R4D_EMU_GATHER((r4d_moegather::gather_kernel<256, true>));
+                else R4D_EMU_GATHER((r4d_moegather::gather_kernel<256, false>));
+            }
+#undef R4D_EMU_GATHER
+        };
+        const std::vector<int32_t> table = inverse_of(plain.sorted);
+        std::vector<uint16_t> y_ref, y_inv, y_self_ref, y_self;
+        gather(table.data(), nullptr, false, y_ref);
+        gather(inv.inv.data(), nullptr, true, y_inv);
+        ++cases;
+        if (y_inv != y_ref) {
+            size_t first = 0;
+            while (first < y_inv.size() && y_inv[first] == y_ref[first]) ++first;
+            std::printf("FAIL moe_gather's sixteen-slot form from the inverse at M=%d n=%d slice "
+                        "%d+%d %s weights, shared %d: first difference at %zu\n",
+                        M, n, sh.base, nl, sh.f32w ? "f32" : "bf16", sh.shared, first);
+            ++fails;
+        }
+        if (T <= (int)r4d_moegather::kGatherSelfT) {
+            gather(nullptr, plain.sorted.data(), false, y_self_ref);
+            gather(nullptr, plain.sorted.data(), true, y_self);
+            ++cases;
+            if (y_self != y_self_ref) {
+                size_t first = 0;
+                while (first < y_self.size() && y_self[first] == y_self_ref[first]) ++first;
+                std::printf("FAIL moe_gather's sixteen-slot form's self-scan at M=%d n=%d %s "
+                            "weights, shared %d: first difference at %zu\n",
+                            M, n, sh.f32w ? "f32" : "bf16", sh.shared, first);
+                ++fails;
+            }
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -458,6 +566,7 @@ int main() {
     int fails = 0, cases = 0;
     router_scatter_cases(rng, cases, fails);
     gather_inverse_cases(rng, cases, fails);
+    gather_sixteen_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }

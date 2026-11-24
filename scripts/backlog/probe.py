@@ -83,24 +83,54 @@ def request_gaps(content, n):
             ln = raw.decode(errors="replace").strip()
             if ln.startswith("data:") and ln[5:].strip() != "[DONE]": ts.append(time.time() - t0)
     return ts
+def stage_sampler(period=0.04):
+    """Poll /stats' expert staging while an arrival runs: (stop flag, samples, t0), a sample being
+    [ms since start, stage_layers, staged_bytes, stage_copies]. The design's staging check (S-02 §5,
+    §10 item 1) is per sub-step: the group's first slice should pay the whole chunk's copy and the
+    later ones find the ring warm, so when the increments happen, against `arrival_ttft`, matters as
+    much as their total."""
+    stop = threading.Event(); samples = []; t0 = time.time()
+    def run():
+        while not stop.is_set():
+            try:
+                e = find(json.loads(get("/stats")), "experts") or {}
+                samples.append([round((time.time() - t0) * 1000), int(e.get("stage_layers") or 0),
+                                int(e.get("staged_bytes") or 0), int(e.get("stage_copies") or 0)])
+            except Exception:
+                pass
+            stop.wait(period)
+    threading.Thread(target=run, daemon=True).start()
+    return stop, samples, t0
+
 def stall(name, nbg, chars, ntok=420, after=1.5):
     out = {}; bg = [None] * nbg
     def w(i): bg[i] = request_gaps(P[i], ntok)
     th = [threading.Thread(target=w, args=(i,)) for i in range(nbg)]
     m0 = metrics(); t0 = time.time()
+    stop, samples, _ = stage_sampler()
     for t in th: t.start()
     time.sleep(after); ta = time.time() - t0
     r = request(long_prompt(chars, 31 + nbg), 8); tb = time.time() - t0
     for t in th: t.join()
+    stop.set()
     m1 = metrics(); md = {k.split(":")[1]: m1[k] - m0.get(k, 0) for k in m1 if m1[k] != m0.get(k, 0)}
     gaps = []
     for ts in bg:
         g = sorted(((b - a) * 1000, a) for a, b in zip(ts, ts[1:]) if ta <= b <= tb + 0.5)
         gaps.append([round(x[0], 1) for x in g[-8:]])
     typ = sorted((b - a) * 1000 for ts in bg for a, b in zip(ts, ts[1:]) if b < ta)
+    # Staging inside the arrival window: the samples' increments over the last one before it.
+    base = [s for s in samples if s[0] / 1000 <= ta]
+    win = [s for s in samples if ta <= s[0] / 1000 <= tb + 0.5]
+    b0 = base[-1] if base else (samples[0] if samples else [0, 0, 0, 0])
+    stage = {"base": [round(ta * 1000), b0[1], b0[2], b0[3]],
+             "samples": [[s[0], s[1] - b0[1], s[2] - b0[2], s[3] - b0[3]] for s in win],
+             "stage_layers": (win[-1][1] if win else b0[1]) - b0[1],
+             "staged_bytes": (win[-1][2] if win else b0[2]) - b0[2],
+             "stage_copies": (win[-1][3] if win else b0[3]) - b0[3]}
     o = {"name": name, "bg": nbg, "arrival_prompt": r["prompt"], "arrival_ttft": round(r["ttft"], 3), "arrive_at": round(ta, 2), "first_at": round(ta + r["ttft"], 2),
-         "typical_gap_ms": round(typ[len(typ) // 2], 1) if typ else None, "worst_gaps_ms": gaps, "metrics": md, "clients": nbg, "mono_ns": [0, 0]}
-    print(json.dumps({k: v for k, v in o.items() if k != "metrics"}), flush=True); time.sleep(2); return o
+         "typical_gap_ms": round(typ[len(typ) // 2], 1) if typ else None, "worst_gaps_ms": gaps, "metrics": md, "clients": nbg, "mono_ns": [0, 0], "stage": stage}
+    print(json.dumps({k: v for k, v in o.items() if k != "metrics"} | {"steps_sliced": md.get("engine_steps_sliced_total", 0), "substeps": md.get("engine_substeps_total", 0)}), flush=True); time.sleep(2); return o
 def greedy_text(content, n=256):
     # Temperature 0 and ignore_eos off: no sampler noise and no cut-off, so the only thing that can
     # change the text is the step's chunking or a kernel's arithmetic.
@@ -260,7 +290,7 @@ def phase(name, prompts, n=256, effort="none"):
          "hit": sd.get("routed_res", 0) / max(1, sd.get("routed", 1)),
          "routed_per_step": sd.get("routed", 0) / max(1, steps),
          "miss_units_per_step": (sd.get("routed", 0) - sd.get("routed_res", 0)) / max(1, steps)}
-    print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in o.items() if k not in ("stats", "metrics")}), flush=True)
+    print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in o.items() if k not in ("stats", "metrics")} | {"steps_sliced": md.get("engine_steps_sliced_total", 0), "substeps": md.get("engine_substeps_total", 0)}), flush=True)
     time.sleep(2)
     return o
 def resume(chars, extra=900, turns=3, ntok=4):

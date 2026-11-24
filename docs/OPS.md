@@ -2270,7 +2270,11 @@ the sum; only the gathered result narrows to bf16, as with bf16 weights.
 libr4d's `moe_gather_bf16` takes f32 weights in its column-per-thread kernel, with the self-scan
 up to 512 slots (and `top_k` up to 64) and the two prepass launches above. The wave-per-token
 form past 512 slots reads bf16 weights only, so f32 weights stay on the column-per-thread kernel
-at every size.
+at every size. At `top_k = 16`, whose rows every launch in the trunk has, that kernel takes its
+sixteen-slot form: eight columns a lane and one sixteen-byte load a slot, the slots of a column
+summed in the same ascending order, so the bytes are the column-per-thread kernel's; it needs
+every row sixteen-byte aligned. A block that declares its sort's inverse table (K-18) also hands
+the gather `moe_gather_inv`, which reads the table instead of scanning the sort or building it.
 
 ### Quantised experts and the row gate
 

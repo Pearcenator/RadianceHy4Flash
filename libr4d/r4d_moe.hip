@@ -74,7 +74,10 @@ using r4d_moesort::scatter_small_kernel;
 using r4d_moegather::kGatherSlots;
 using r4d_moegather::kGatherSelfT;
 using r4d_moegather::gather_kernel;
+using r4d_moegather::gather_kernel16;
+using r4d_moegather::kGatherCols;
 using r4d_moegather::r4dchain_moe_gather;
+using r4d_moegather::r4dchain_moe_gather16;
 constexpr uint32_t kBlock = 128;          // the fp8 scale block, along K and along N
 /* Run-map entry that owns no expert: rows above `off[n_expert]` are dropped slots whose output must
  * be zeroed. Declared here because the GEMM reads it; the map is built further down. */
@@ -2363,9 +2366,10 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
 }  /* namespace */
 
 /* The gather's form, pinnable for tests: 0 the launcher's rule, 1 gather_kernel (a column per
- * thread), 2 gather_wide_kernel (a wave per token). The rule takes 2 past the self-scan bound where
- * the shape allows (r4d_rad_moe_gather); an impossible pin is refused. Both are bit-identical
- * (r4d_selftest). */
+ * thread), 2 gather_wide_kernel (a wave per token), 3 gather_kernel16 (sixteen slots, eight
+ * columns a lane). The rule takes 2 past the self-scan bound where the shape allows and 3 wherever
+ * top_k is 16 and the rows are sixteen-byte aligned (r4d_rad_moe_gather); an impossible pin is
+ * refused. All are bit-identical (r4d_selftest). */
 static int g_moe_gather_pin = 0;
 extern "C" void r4d_moe_gather_pin_form(int form) { g_moe_gather_pin = form; }
 
@@ -3476,10 +3480,16 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
     const bool wide_ok = ew->dtype == RAD_BF16 && !small && top_k <= (long long)kGatherWideSlots &&
                          n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
+    /* The sixteen-slot form (gather_kernel16, eight columns a lane, one sixteen-byte load a slot):
+     * top_k = 16 with the rows sixteen-byte aligned. At any T, so it serves the decode shapes and
+     * the passes that keep the prepass. */
+    const bool sixteen = top_k == 16 && n % (long long)kGatherCols == 0 && al16(ye->data, ye_ld) &&
+                         al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
     const int gpin = g_moe_gather_pin;
-    if (gpin < 0 || gpin > 2) return R4D_NO(RAD_E_INVAL);
-    if (gpin >= 2 && !wide_ok) return R4D_NO(RAD_E_UNSUPPORTED);
-    if ((gpin == 0 && wide_ok) || gpin >= 2) {
+    if (gpin < 0 || gpin > 3) return R4D_NO(RAD_E_INVAL);
+    if (gpin == 2 && !wide_ok) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (gpin == 3 && !sixteen) return R4D_NO(RAD_E_UNSUPPORTED);
+    if ((gpin == 0 && wide_ok) || gpin == 2) {
         constexpr uint32_t NW = 8;
         const unsigned gw = (unsigned)((n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols));
         hipLaunchKernelGGL((gather_wide_kernel<NW>), dim3((unsigned)((M + NW - 1) / NW), gw),
@@ -3494,7 +3504,11 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
         return RAD_OK;
     }
 
-    const unsigned gy = (unsigned)((n + 255) / 256);
+    /* The eight-column form's grid, one group of eight columns a lane. */
+    const bool form16 = sixteen && gpin != 1;
+    const unsigned gy = form16
+        ? (unsigned)((n + 256 * kGatherCols - 1) / (256 * kGatherCols))
+        : (unsigned)((n + 255) / 256);
     /* The chained form where the row resolved with `chain` and this launch is the op's only one
      * (no prepass before it: a decode step). */
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && (self || given) && M <= 64;
@@ -3508,11 +3522,21 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
                        sh ? (const uint16_t*)sg->data : nullptr,                                 \
                        (uint32_t)sh_ld, (uint32_t)sg_ld, sig)
     if (ew->dtype == RAD_F32) {
-        if (chain) R4D_MG(r4dchain_moe_gather<256, true>);
-        else       R4D_MG(gather_kernel<256, true>);
+        if (chain) {
+            if (form16) R4D_MG(r4dchain_moe_gather16<256, true>);
+            else        R4D_MG(r4dchain_moe_gather<256, true>);
+        } else {
+            if (form16) R4D_MG(gather_kernel16<256, true>);
+            else        R4D_MG(gather_kernel<256, true>);
+        }
     } else {
-        if (chain) R4D_MG(r4dchain_moe_gather<256>);
-        else       R4D_MG(gather_kernel<256>);
+        if (chain) {
+            if (form16) R4D_MG(r4dchain_moe_gather16<256>);
+            else        R4D_MG(r4dchain_moe_gather<256>);
+        } else {
+            if (form16) R4D_MG(gather_kernel16<256>);
+            else        R4D_MG(gather_kernel<256>);
+        }
     }
 #undef R4D_MG
     R4D_MOE_CHK();
