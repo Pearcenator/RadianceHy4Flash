@@ -721,8 +721,9 @@ void r4d_moe_gemm_pin_fk(int pin);
 // the launch is not the aligned form). Bit-identical.
 void r4d_moe_gemm_pin_down_tile(int pin);
 // Test hook: pins the gather's form. 0 is the launcher's rule, 1 a column a thread
-// (gather_kernel), 2 a wave a token and sixteen bytes a lane (gather_wide_kernel), refused on a
-// shape it cannot take. Bit-identical.
+// (gather_kernel), 2 a wave a token and sixteen bytes a lane (gather_wide_kernel), 3 sixteen slots
+// with eight columns a lane (gather_kernel16, top_k = 16), each refused on a shape it cannot take.
+// Bit-identical.
 void r4d_moe_gather_pin_form(int form);
 // Test hook: pins the sorted operand's decode kernel. 0 is the launcher's rule
 // (moe_down_dec_kernel on the sorted operand, one part, at most 512 experts, column tiles set by

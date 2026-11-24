@@ -1508,6 +1508,62 @@ TEST(quantised_routed_experts_are_served_clamped) {
     }
 }
 
+/* K-18: the block declares the sort's inverse table, so the fused selection or the separate
+ * `moe_scatter_inv` writes `moe.expert_slot` and `moe_gather_inv` reads it instead of rebuilding
+ * it; without the device rows the pair falls back to `moe_scatter` / `moe_gather`, which scan the
+ * sort and add the two prepass launches above 512 slots. */
+std::vector<std::string> g_undecl;
+void undeclaring_encs(RadBuilder* b) {
+    bf16_encs(b);
+    for (const std::string& op : g_undecl) b->undeclared.insert(op);
+}
+TEST(the_moe_gather_reads_the_sorts_inverse_table) {
+    struct Case {
+        const char* what;
+        std::vector<std::string> undecl;
+        int invg;    /* per MoE layer: moe_gather_inv (1) or moe_gather (0) */
+        int writers; /* ops that write the inverse table: the fused selection and the separate
+                      * scatter above it (the block declares both, each for a size of pass) */
+    };
+    const Case cases[] = {
+        { "the fused selection", {}, 1, 4 },
+        { "the separate sort", { "router_sigmoid_topk_scatter" }, 1, 2 },
+        { "no device rows", { "router_sigmoid_topk_scatter", "moe_scatter_inv", "moe_gather_inv" },
+          0, 0 },
+    };
+    for (const Case& c : cases) {
+        fprintf(stderr, "case %s\n", c.what);
+        g_undecl = c.undecl;
+        Declared d(undeclaring_encs);
+        g_undecl.clear();
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const rad_buf inv = buf_named(d.b, "moe.expert_slot");
+        const rad_buf sorted = buf_named(d.b, "moe.expert_sorted");
+        REQUIRE(inv != 0);
+        REQUIRE(sorted != 0);
+        int writers = 0;
+        for (const auto& o : d.b.ops)
+            if (in(o.writes, inv)) ++writers;
+        CHECK_EQ(count_op(d.b, "moe_gather_inv"), c.invg * 2);
+        CHECK_EQ(count_op(d.b, "moe_gather"), (1 - c.invg) * 2);
+        CHECK_EQ(writers, c.writers);
+        for (int i = 0; i < c.invg * 2; ++i) {
+            const RecOp* o = find_op(d.b, "moe_gather_inv", i);
+            REQUIRE(o != nullptr);
+            REQUIRE(o->reads.size() >= 3);
+            CHECK_EQ(o->reads[2], inv);
+        }
+        for (int i = 0; i < (1 - c.invg) * 2; ++i) {
+            const RecOp* o = find_op(d.b, "moe_gather", i);
+            REQUIRE(o != nullptr);
+            REQUIRE(o->reads.size() >= 3);
+            CHECK_EQ(o->reads[2], sorted);
+        }
+        every_weight_read(d.b);
+        steps_clean_at(d.b, 0, 1);
+    }
+}
+
 /* Trunk linears a recipe made int8 (rotated or not) or the u5 trellis read int8 codes from their
  * input's bf16 plane; the others stay bf16 GEMMs, and an int8 lm_head is read by logits_gemm at its
  * codes' dtype. Linears of one input and one code form share one quantiser (Lin::feed: q_a with

@@ -708,6 +708,15 @@ Measured basis: §2.6 (stall probe of this note) and the BetterBench workload ph
 - Change: plan a chunk as m sub-steps; sub-step j runs the decode rows through all 42 layers and the chunk rows through layers `[L_j, L_{j+1})`; the chunk's residual / iHC streams (2048 x 4 x 3072 bf16 = 50 MiB a rank) and DFly2 taps persist between sub-steps. Mixed-step composition `scheduler.cpp:2650-2700`, `RadBatch::n_seq_decode`, hyv4flash step `hyv4flash.cpp:1106-1213`, pass key `core/runtime/ctx.cpp:1008`. The stager stages per slice.
 - Why: the stall equals the chunk step because decoders ride the whole of it; shrinking the chunk does not help (a 256-row step still reads every expert of every layer: M (`work/sweep`): chunk 256 stalls 444 ms at 7.4x TTFT). Slicing keeps "each layer's experts read once per 2048 rows". This is the only stall lever found that leaves the TTFT/stall frontier; FP-10 (second queue) needs a second all-reduce instance, per-stream counters, a second arena region, stager races and CU masking (`ctx.h:757-799`, `r4d_ar_seq.h`): keep FP-10 as research only.
 - Verify: greedy continuation byte-identical against unsliced; `sched_test` shapes; stall probe; BetterBench workload.
+- Closed, without code (`notes/backlog/closed/S-02-exec.md`): the lever was built and ran (a sliced prefill chunk
+  byte-identical to the unsliced one — the chunk's last read and the 63 decode reads after it, all four dumped buffers —
+  `sched_test` shapes, the hook's A/B), and on the lane it halves the bulk of the decoder's wait -- 0.43-0.56 s ->
+  0.23-0.28 s at m = 4 -- but it does not reach the item's number: the arrival's TTFT rises 2.070 -> 2.608 s (+26 %),
+  a ~0.43-0.49 s gap survives in every arm including unsliced (the arrival's boundary, not the chunk), `auto` plans
+  m = 2 rather than the 6-7 its 150 ms target asks for, and slicing doubles the expert copy (123 layers / 12.16 GiB
+  unsliced against 246 / 24.31 at m = 4) because the decode rows' trunk pass and the chunk's slices evict each other
+  from the ring -- so the stager fallbacks of design §5 come first. The code is reverted (`af25a666`); the harness it
+  needed (`scripts/backlog/probe.py`'s stage sampler) stays.
 
 #### S-03 Issue the mixed step ahead (admission and mid-prompt chunks at issue-ahead time)
 - Area scheduler/engine · PL · Gain arrival TTFT -8..-30 ms (one decode step), host turnaround of every mixed step overlapped · Conf medium · Effort M

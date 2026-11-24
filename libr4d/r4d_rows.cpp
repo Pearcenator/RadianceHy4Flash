@@ -9816,7 +9816,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "moe_gather_bf16", "moe_gather", "moe",
   "the weighted scatter back to token order, summing a token's slots in ascending slot order",
-  "any M and n; the inverse permutation is built in scratch rather than searched",
+  "any M and n; the inverse permutation is built in scratch rather than searched, and top_k = 16\n"
+  "  with sixteen-byte rows takes the sixteen-slot form (eight columns a lane, one load a slot)",
   "bf16 in and out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cMoeGather), NOTUNE,

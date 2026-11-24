@@ -135,6 +135,10 @@ struct MoeWire {
         w.eoff = decl_b(b, nm.f("moe.expert_offsets"), RAD_I32, { s.n_expert_r + 1 });
         w.ecnt = decl_b(b, nm.f("moe.expert_counts"), RAD_I32, { s.n_expert_r });
         w.sorted = decl_b(b, nm.f("moe.expert_sorted"), RAD_I32, { T * k });
+        /* The sort's inverse table, so `moe_scatter_inv` writes the gather's slot table and
+         * `moe_gather_inv` reads it: without it a pass above the gather's self-scan bound adds two
+         * prepass launches and loses the chained form (K-18). */
+        w.inv = decl_b(b, nm.f("moe.expert_slot"), RAD_I32, { T * k });
         w.egu = bf("moe.expert_gate_up", { T * k, 2 * F });
         w.eff.x = bf("moe.expert_ff", { T * k, F });
         w.edn = bf("moe.expert_down", { T * k, L });

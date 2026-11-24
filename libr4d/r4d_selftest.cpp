@@ -3433,11 +3433,13 @@ static void scatter_protect_at(const RadKernelInfo* rs, int64_t M, int64_t nl, i
  * Past the self-scan cap the op builds the slot inverse in scratch and sums each token's slots,
  * using gather_wide_kernel (a wave per token, sixteen bytes per lane) where the slots fit its
  * registers and every row starts on sixteen bytes, and gather_kernel (a column per thread)
- * elsewhere. r4d_moe_gather_pin_form pins each (1 column per thread, 2 wave per token), and every
- * form must write the column-per-thread bytes: with and without the shared arm, under both gates,
- * with dropped slots, at a width ending inside a column group, and at Qwen3.8-Flash-Next's
+ * elsewhere. r4d_moe_gather_pin_form pins each (1 column per thread, 2 wave per token, 3 sixteen
+ * slots and eight columns a lane), and every form must write the column-per-thread bytes: with and
+ * without the shared arm, under both gates, with dropped slots, at a width ending inside a column
+ * group, at top_k = 16 (K-18's form, and Hy4-flash's decode), and at Qwen3.8-Flash-Next's
  * 2048-token chunk on a rank of four (also timed). A decode step (under the cap), a top_k past the
- * wide form's registers, and a width not tiled by sixteen-byte pieces must refuse the wide pin.
+ * wide form's registers, and a width not tiled by sixteen-byte pieces must refuse the wide pin;
+ * and a shape without top_k = 16 or with such a width must refuse the sixteen-slot pin.
  * `wide` says whether the shape takes the wide form. */
 struct MoeGatherShape { int64_t M, n, k; const char* act; bool wide; };
 
@@ -3544,16 +3546,20 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
             }
         ok(("MoE gather preserves F32 weights and BF16 arm rounding" + at).c_str(), exact);
     }
-    struct Var { int form; const char* name; bool wide; };
+    struct Var { int form; const char* name; bool wide; bool six; };
+    /* Whether the launcher's shape check lets the sixteen-slot form run here: top_k = 16 and every
+     * row a whole number of sixteen-byte groups (the test's buffers start sixteen-byte aligned). */
+    const bool sixteen = k == 16 && n % 8 == 0;
     static const Var kVar[] = {
-        { 0, "the rule",                                  false },
-        { 2, "a wave a token",                            true  },
+        { 0, "the rule",       false, false },
+        { 2, "a wave a token", true,  false },
+        { 3, "sixteen slots",  false, true  },
     };
     for (const Var& v : kVar) {
         const std::string label = "moe_gather, " + std::string(v.name) + at;
         const int rc = run(v.form, got);
-        if (v.wide && (!sh.wide || f32)) {
-            /* A shape the wide form cannot take refuses the pin rather than run another form. */
+        if ((v.wide && (!sh.wide || f32)) || (v.six && !sixteen)) {
+            /* A shape the form cannot take refuses the pin rather than run another form. */
             ok((label + " is refused").c_str(), rc == RAD_E_UNSUPPORTED, "rc=" + std::to_string(rc));
             continue;
         }
@@ -3596,6 +3602,32 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
         st_ev_destroy(e0);
         st_ev_destroy(e1);
     }
+    /* K-18: the sixteen-slot form at the shapes it is taken for -- the decode heights, where the
+     * launcher's rule picks it (f32 weights, Hy4-flash's), pinned against the scalar form. */
+    if (sixteen && M <= 64) {
+        hipEvent_t e0, e1;
+        st_ev_create(&e0);
+        st_ev_create(&e1);
+        auto time = [&](int form) -> float {
+            const int it = 200;
+            pl.pin_gather(form);
+            for (int w = 0; w < 20; ++w) r->launch(&a, nullptr);
+            st_ev_record(e0, nullptr);
+            for (int i = 0; i < it; ++i) r->launch(&a, nullptr);
+            st_ev_record(e1, nullptr);
+            st_ev_sync(e1);
+            float ms = 0.0f;
+            st_ev_elapsed(&ms, e0, e1);
+            pl.pin_gather(0);
+            return ms * 1000.0f / (float)it;
+        };
+        const float t0 = time(0), t1 = time(1), t3 = time(3);
+        std::printf("      moe_gather at %lld routed rows x %lld, top_k 16: the rule %.2f us, a "
+                    "column a thread %.2f us, sixteen slots %.2f us a call\n",
+                    (long long)NS, (long long)n, t0, t1, t3);
+        st_ev_destroy(e0);
+        st_ev_destroy(e1);
+    }
 }
 
 static void moe_gather_case(const Plugin& pl) {
@@ -3612,8 +3644,22 @@ static void moe_gather_case(const Plugin& pl) {
         {  100,  512, 20, "sigmoid", false },   /* top_k past the wide form's registers */
         {  100,  260, 10, nullptr,   false },   /* a width sixteen-byte pieces do not tile */
         { 2048, 2560, 10, "sigmoid", true  },   /* Qwen3.8-Flash-Next's chunk, timed */
+        /* K-18: top_k = 16, Hy4-flash's routing -- the c8 verify (the self-scan form), one row,
+         * past the self-scan bound (the prepass form), the ungated arm, and a width the
+         * sixteen-byte groups do not tile. */
+        {   32, 2560, 16, "sigmoid", false },
+        {   32, 2560, 16, "none",    false },
+        {    1, 4096, 16, "sigmoid", false },
+        {   64, 2560, 16, "sigmoid", true  },   /* timed, the rule's and pinned forms */
+        {   48,  520, 16, nullptr,   true  },
+        {   48,  260, 16, "none",    false },   /* refused by the sixteen-slot form */
     };
     for (const MoeGatherShape& sh : kSh) moe_gather_at(pl, r, sh);
+    // Hy4-flash's decode: f32 routing weights, top_k 16, so the rule takes the sixteen-slot form.
+    for (int64_t m : { 1, 8, 32 })
+        for (int64_t n : { 2560, 4096 })
+            for (bool shared : { false, true })
+                moe_gather_at(pl, r, { m, n, 16, shared ? "none" : nullptr, false }, true);
     // HYV3's TP1 shared combine is the unity-gate form. Preserve the routed BF16 narrow
     // before adding the shared BF16 output, at decode and past the self-scan boundary.
     for (int64_t m : { 1, 4, 65 })
