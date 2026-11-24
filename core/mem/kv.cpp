@@ -304,17 +304,16 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
         if (p.runtime_win && !p.zero)
             fixed += align_up(max_seqs_ * p.ring_blocks_max() * p.bytes_per_block, RAD_ALIGN_UNIT);
 
-    /* The checkpoint stage (ckpt_stage): one snapshot of the linear state, where a lone spanned
-     * prefill may take its tail snapshot inside its last chunk (--prefill-span above 1,
-     * --prefill-tail-snapshot on), the engine snapshots into a prefix cache and the slot carries
-     * no window. */
+    /* The checkpoint stage (ckpt_stage): one snapshot of the linear state, where a prefill alone
+     * in its step may take its tail snapshot inside its last chunk (--prefill-tail-snapshot on)
+     * and the engine snapshots into a prefix cache. A window section beside the linear state is
+     * saved from the live pages (checkpoint_save_window), so the stage holds the linear part. */
     stage_bytes_ = 0;
     {
         int64_t lin = 0;
         for (const auto& p : plans_) if (p.stateful() && !p.zero) lin += p.bytes_per_state;
-        if (cfg.ckpt_stage && cfg.prefill_span > 1 && cfg.prefill_tail_snapshot &&
-            cfg.prefix_cache && cfg.checkpoint_slots != 0 && window_ck_bytes_ == 0 && lin > 0 &&
-            lin == checkpoint_bytes_)
+        if (cfg.ckpt_stage && cfg.prefill_tail_snapshot && cfg.prefix_cache &&
+            cfg.checkpoint_slots != 0 && lin > 0 && lin == checkpoint_bytes_ - window_ck_bytes_)
             stage_bytes_ = lin;
     }
     if (stage_bytes_ > 0) fixed += align_up(stage_bytes_, RAD_ALIGN_UNIT);
@@ -1733,7 +1732,8 @@ void* KVManager::checkpoint_ptr(int32_t slot) const {
 /* Save and restore share one traversal because the blob has no header: its layout is defined
  * only by this walk order. */
 int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t ck_slot,
-                               bool save, RadStream s, const std::vector<int32_t>* win) {
+                               bool save, RadStream s, const std::vector<int32_t>* win,
+                               bool window_only) {
     /* The slot must be held in the shared store (rank 0 hands out ids, so followers check the
      * store). A slot not in use is a lifetime fault in whoever handed out the id. */
     const char* dir = save ? "save into" : "restore from";
@@ -1782,7 +1782,8 @@ int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t 
                     "a rank", (int)ck_slot, (long long)checkpoint_bytes_);
             return RAD_E_STATE;
         }
-        const int cs = save ? rad_memcpy_2d_async(ck + off, nbytes, st, p.layer_stride(), nbytes,
+        const int cs = window_only ? RAD_OK
+                     : save ? rad_memcpy_2d_async(ck + off, nbytes, st, p.layer_stride(), nbytes,
                                                   p.n_layers, s)
                             : rad_memcpy_2d_async(st, p.layer_stride(), ck + off, nbytes, nbytes,
                                                   p.n_layers, s);
@@ -1852,6 +1853,11 @@ int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t 
 int KVManager::checkpoint_save(const int32_t* slots, int n, int32_t ck, RadStream s,
                                const std::vector<int32_t>* win) {
     return checkpoint_copy(slots, n, ck, /*save=*/true, s, win);
+}
+int KVManager::checkpoint_save_window(const int32_t* slots, int n, int32_t ck, RadStream s,
+                                      const std::vector<int32_t>* win) {
+    if (window_ck_bytes_ <= 0) return RAD_OK;
+    return checkpoint_copy(slots, n, ck, /*save=*/true, s, win, /*window_only=*/true);
 }
 int KVManager::checkpoint_restore(const int32_t* slots, int n, int32_t ck, RadStream s,
                                   const std::vector<int32_t>* win) {

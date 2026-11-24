@@ -560,6 +560,68 @@ TEST(the_compact_pass_reads_its_query_bounds_from_the_tail) {
     }
 }
 
+/* X-02: a lone prefill step with its checkpoint inside it (RadBatch::ckpt_cut). Every sparse
+ * layer's tail ring and every Engram window are written in two pieces, [0, cut) and [cut, T), with
+ * the snapshot of that layer's state (rad_ckpt_snap) between them; a step without the cut writes
+ * each once and snapshots nothing. The probe says so unless RADIANCE_HY4_CKPT_SNAP=0. */
+TEST(a_checkpoint_inside_the_step_cuts_the_tail_ring_and_the_engram_window) {
+    {
+        RadArchProbe p{};
+        CHECK_OK(hyv4flash::probe(mini_meta().meta(), &p));
+        CHECK_EQ(p.ckpt_snap_ok, 1);
+        setenv("RADIANCE_HY4_CKPT_SNAP", "0", 1);
+        RadArchProbe q{};
+        CHECK_OK(hyv4flash::probe(mini_meta().meta(), &q));
+        unsetenv("RADIANCE_HY4_CKPT_SNAP");
+        CHECK_EQ(q.ckpt_snap_ok, 0);
+    }
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    int32_t ckcu[3] = { 0, 8, 12 };
+    for (int cut : { 0, 8 }) {
+        auto k = kit(d.b, {}, { 12 }, 16);
+        k->b.positions_h = k->pos.data();
+        k->b.ckpt_cut = cut;
+        k->b.ckpt_cu = cut ? ckcu : nullptr;
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(d.b, &c);
+        CHECK(c.step_fail.empty());
+        /* The issues of `op`, and one snapshot of `group` between the two pieces. */
+        auto pieces = [&](rad_op op, rad_kvgroup group) {
+            std::vector<size_t> at;
+            for (size_t i = 0; i < c.issues.size(); ++i)
+                if (c.issues[i].op == op) at.push_back(i);
+            if (!cut) {
+                REQUIRE_EQ(at.size(), (size_t)1);
+                return;
+            }
+            REQUIRE_EQ(at.size(), (size_t)2);
+            CHECK(c.issues[at[0]].opd[2].raw == (const void*)ckcu);
+            CHECK(c.issues[at[1]].opd[2].raw == (const void*)(ckcu + 1));
+            int between = 0;
+            for (const SnapRec& s : c.snaps)
+                if (s.group == (int)group && s.at > at[0] && s.at <= at[1]) ++between;
+            CHECK_EQ(between, 1);
+        };
+        size_t stateful = 0;
+        for (const auto& l : m.layers) {
+            if (l.sliding) continue;
+            ++stateful;
+            pieces(l.ix.op_tail, l.ix.tail);
+            for (const auto& is : c.issues)
+                if (is.op == l.ix.op_tail) CHECK_EQ(is.n, cut ? (is.opd[2].raw == ckcu ? 8 : 4) : 12);
+        }
+        for (const auto& e : m.engrams) {
+            ++stateful;
+            pieces(e.op_ids, e.hist);
+        }
+        CHECK(stateful >= 2);
+        CHECK_EQ(c.snaps.size(), cut ? stateful : (size_t)0);
+    }
+}
+
 /* #74 review, point 2: the compact pass reads its rows [0, DT) as the batch's decode rows, so a
  * tail that does not keep them whole and in place (here decode row 1 dropped) runs the full pass
  * rather than mis-map them; the same step with the decode rows kept compacts. */

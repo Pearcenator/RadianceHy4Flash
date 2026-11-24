@@ -6948,6 +6948,61 @@ TEST(a_checkpoint_carries_copy_zero_of_every_state_layer_in_plan_order) {
     rad_stream_destroy(st);
 }
 
+/* X-02: the checkpoint stage beside a window section (Hy4's slot: linear state, then its sliding
+ * window). The stage holds the linear part only, and checkpoint_save_window writes the window
+ * section alone: the same bytes checkpoint_save writes there, the linear section untouched (the
+ * stage's copy goes there, checkpoint_stage_out). Without Config::ckpt_stage there is no stage. */
+TEST(a_stage_beside_a_window_holds_the_linear_state_and_the_window_saves_alone) {
+    if (!host_backend_or_skip("the window-only save")) return;
+    std::vector<KVGroupInfo> g = hybrid_groups();
+    g.push_back(paged_group("swa", RAD_KV_WINDOW, 2, 16, { 6 }, 64));   /* handle 3 */
+    {
+        Fixture off;
+        off.cfg.checkpoint_slots = 4;
+        REQUIRE_EQ(off.build_groups(g), RAD_OK);
+        CHECK_EQ(off.kv.ckpt_stage_bytes(), 0ll);
+    }
+    Fixture f;
+    f.cfg.checkpoint_slots = 4;
+    f.cfg.ckpt_stage = true;
+    REQUIRE_EQ(f.build_groups(g), RAD_OK);
+    REQUIRE(f.kv.has_window_snapshot());
+    const int64_t lin = f.kv.plan(2)->bytes_per_state;
+    CHECK_EQ(f.kv.ckpt_stage_bytes(), lin);
+    CHECK(f.kv.ckpt_stage() != nullptr);
+    REQUIRE(f.kv.checkpoint_bytes() > lin);
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 128));
+    fill_states(f.kv, 0);
+    std::vector<int32_t> win;
+    REQUIRE(f.kv.window_rows(1, 128, &win));
+    const std::vector<int32_t> a = slots_of(f.kv, 1);
+    int32_t full = -1, part = -1;
+    REQUIRE_EQ(f.kv.alloc_checkpoint(&full), RAD_OK);
+    REQUIRE_EQ(f.kv.alloc_checkpoint(&part), RAD_OK);
+    const size_t n = (size_t)f.kv.checkpoint_bytes();
+    unsigned char* fb = (unsigned char*)f.kv.checkpoint_ptr(full);
+    unsigned char* pb = (unsigned char*)f.kv.checkpoint_ptr(part);
+    /* The same byte under both window sections: a page below position zero (-1) is skipped. */
+    std::memset(fb, 0x11, n);
+    std::memset(pb, 0x11, n);
+    std::memset(pb, 0xA5, (size_t)lin);
+    RadStream st = nullptr;
+    REQUIRE_EQ(rad_stream_create(&st, 0), RAD_OK);
+    CHECK_OK(f.kv.checkpoint_save(a.data(), (int)a.size(), full, st, &win));
+    CHECK_OK(f.kv.checkpoint_save_window(a.data(), (int)a.size(), part, st, &win));
+    CHECK_OK(rad_stream_sync(st));
+    rad_stream_destroy(st);
+    int64_t lin_wrong = 0, win_wrong = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if ((int64_t)i < lin) lin_wrong += pb[i] != 0xA5;
+        else                  win_wrong += pb[i] != fb[i];
+    }
+    CHECK_EQ(lin_wrong, 0ll);
+    CHECK_EQ(win_wrong, 0ll);
+}
+
 /* Under tensor parallelism one slot holds every rank's shard at its own offset, and rank 0 hands
  * out the id. Each rank restores its own shard: at a shared offset the last writer's state would
  * be restored on both. */

@@ -1956,10 +1956,16 @@ int Engine::ckpt_stage_open() {
 int Engine::ckpt_stage_arm(const RadBatch* b) {
     if (ck_stage_off_.empty()) return RAD_OK;
     const StepEntry* in = nullptr;
-    if (b && b->ckpt_cut > 0)
-        for (const StepEntry& e : sched_.plan().e)
-            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) in = &e;
-    if (!in) {
+    for (const StepEntry& e : sched_.plan().e)
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) in = &e;
+    if (in && b && b->ckpt_cut <= 0 && !b->draft_pass && !b->enc && !b->gen) {
+        /* save_checkpoints would take the stage for it, which this step does not write. */
+        RAD_ERR("step %d: sequence %llu's checkpoint lies inside the step (row %d) and the step "
+                "is not cut there (a prefill alone in its step is the one shape that is)",
+                b->step, (unsigned long long)in->seq, (int)in->ckpt_tok);
+        return RAD_E_STATE;
+    }
+    if (!in || !(b && b->ckpt_cut > 0)) {
         for (auto& rk : ranks_) rk->ctx.set_ckpt_snap(nullptr, ckpt_slots_, ck_stage_off_, ck_stage_lb_);
         return RAD_OK;
     }
@@ -2022,6 +2028,12 @@ int Engine::save_checkpoints() {
                             ckpt_slots_.data(), (int)ckpt_slots_.size(), rk->ctx.stream(),
                             [&](size_t g, int64_t li) { return rk->ctx.ckpt_snapped(g, li); });
                         if (s >= 0) s = rk->kv.checkpoint_stage_out(e.ckpt_slot, rk->ctx.stream());
+                        /* The window behind the checkpoint: its pages lie below it and are held
+                         * until the next step's first query, so the live pages are its own. */
+                        if (s >= 0)
+                            s = rk->kv.checkpoint_save_window(ckpt_slots_.data(),
+                                                              (int)ckpt_slots_.size(), e.ckpt_slot,
+                                                              rk->ctx.stream(), &ckpt_win_);
                     }
                     if (s < 0) {
                         RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "

@@ -1312,14 +1312,16 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
              * leaves, so the final chunk splits at the last quantum boundary and the remainder
              * (under a quantum) runs as the next step's chunk (tail_checkpoint decides when that
              * is worth it). A window's tail snapshot is taken above, inside its chunk. */
-            /* A prefill alone in its spanned step whose plugin snapshots inside the step
-             * (set_ckpt_inside) takes either snapshot below inside its last chunk, at the same
-             * position, and runs to the prompt's end: the rows past it would otherwise be a step
-             * of their own, which on a routed model reads nearly every expert for a few dozen
-             * rows. Its tail snapshot splits nothing, so it is taken however few rows it lies
-             * past the interval boundary below it (tail_checkpoint's in_step). */
-            const bool inside = ckpt_inside_ && cfg_.prefill_tail_snapshot && geo_.span > 1 &&
-                                span_now_ && cfg_.prefill_span > 1 && !geo_.window_ckpt;
+            /* A prefill alone in its step (a spanned one, or lone_now_ without a span) whose
+             * plugin snapshots inside the step (set_ckpt_inside) takes either snapshot below
+             * inside its last chunk, at the same position, and runs to the prompt's end: the rows
+             * past it would otherwise be a step of their own, which on a routed model reads nearly
+             * every expert for a few dozen rows. Its tail snapshot splits nothing, so it is taken
+             * however few rows it lies past the interval boundary below it (tail_checkpoint's
+             * in_step). Never in a mixed step planned ahead (ahead_now_). */
+            const bool alone = lone_now_ || (geo_.span > 1 && span_now_ && cfg_.prefill_span > 1);
+            const bool inside = ckpt_inside_ && cfg_.prefill_tail_snapshot && alone &&
+                                !ahead_now_ && !geo_.window_ckpt;
             const int64_t tail = geo_.window_ckpt ? -1 : tail_checkpoint(n_target, inside);
             if (inside && tail > n_computed) {
                 if (checkpoint_pos) *checkpoint_pos = tail;
@@ -2464,6 +2466,8 @@ const RadBatch* Scheduler::step() {
      * grid, so a prompt may switch between them at any step. */
     span_now_ = true;
     struct SpanReset { bool& f; ~SpanReset() { f = true; } } span_reset{span_now_};
+    lone_now_ = false;
+    struct LoneReset { bool& f; ~LoneReset() { f = false; } } lone_reset{lone_now_};
     /* The running request a spanned step holds, or -1: every other running request sits it out. */
     int32_t span_slot = -1;
     /* Keyed on the flag, not on whether this model has intervals to span: the engine told the
@@ -2501,6 +2505,19 @@ const RadBatch* Scheduler::step() {
         }
         span_now_ = lone;
         if (!lone) budget = geo_.shared_tok;
+    } else if (ckpt_inside_) {
+        /* Without a span a step holds one prefill alone only where nothing else runs or can be
+         * admitted: then its tail snapshot goes inside its last chunk (plan_chunk). */
+        const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                    (int64_t)running_.size() < cfg_.max_seqs;
+        if (running_.size() == 1 && !admit_possible) {
+            const SchedReq& sr = *reqs_[(size_t)running_[0]];
+            const Request& rr = *sr.req;
+            lone_now_ = !(rr.n_computed >= (int64_t)rr.prompt.size() &&
+                          rr.n_computed + 1 >= sr.seq_len());   /* not a decode row */
+        } else if (running_.empty() && waiting_.size() == 1) {
+            lone_now_ = true;
+        }
     }
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
@@ -2559,8 +2576,9 @@ const RadBatch* Scheduler::step() {
      * admitted, so new work never preempts work half done. */
     for (size_t i = 0; i < running_.size(); ) {
         if ((int64_t)plan_.e.size() >= cfg_.max_seqs || budget <= 0) break;
-        /* A spanned step holds one sequence (RadBuildCtx::max_mixed_tok): the one chosen above. */
-        if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+        /* A spanned step holds one sequence (RadBuildCtx::max_mixed_tok): the one chosen above;
+         * so does a lone one (lone_now_). */
+        if (((cfg_.prefill_span > 1 && span_now_) || lone_now_) && !plan_.e.empty()) break;
         if (span_slot >= 0 && running_[i] != span_slot) { ++i; continue; }
 
         int32_t slot = running_[i];
@@ -2777,8 +2795,8 @@ const RadBatch* Scheduler::step() {
         bool reclaimed_idle_states = false;
         while (at < waiting_.size() &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
-            /* A step planned for one prefill holds that one (span_now_ above). */
-            if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+            /* A step planned for one prefill holds that one (span_now_, lone_now_ above). */
+            if (((cfg_.prefill_span > 1 && span_now_) || lone_now_) && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
             /* Generation reserves one position after the prompt. An embedding consumes just
@@ -3253,6 +3271,8 @@ const RadBatch* Scheduler::refuse_ahead(AheadRefused why) {
 
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
+    ahead_now_ = true;
+    struct AheadReset { bool& f; ~AheadReset() { f = false; } } ahead_reset{ahead_now_};
     /* S-02: a group's next sub-step is planned from its frozen set, with no admission against it;
      * the step after the last sub-step is planned normally by step() after the commit. */
     if (group_.active) {

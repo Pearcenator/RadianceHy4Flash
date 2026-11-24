@@ -631,6 +631,10 @@ public:
      * a bad slot or an unknown sequence. */
     int checkpoint_save(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
                         const std::vector<int32_t>* win = nullptr);
+    /* The window section alone (the linear section comes from the stage, checkpoint_stage_out):
+     * a checkpoint inside the step whose slot also carries a window. */
+    int checkpoint_save_window(const int32_t* state_slots, int n_slots, int32_t ck_slot,
+                               RadStream s, const std::vector<int32_t>* win);
     int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
                            const std::vector<int32_t>* win = nullptr);
 
@@ -644,10 +648,11 @@ public:
      * copies the layers the step left alone in (checkpoint_stage_rest) and the stage to the host
      * slot in one copy (checkpoint_stage_out, Engine::save_checkpoints).
      *
-     * Planned (plan_groups) where the engine snapshots linear state into a prefix cache and the
-     * slot has no window section, under Config::ckpt_stage (the plugin cuts its step at a tail
-     * snapshot and --prefix-resume is nearest); 0 bytes and a null stage otherwise, which keeps
-     * every checkpoint at a chunk's end. */
+     * Planned (plan_groups) where the engine snapshots linear state into a prefix cache, under
+     * Config::ckpt_stage (the plugin cuts its step at a tail snapshot and --prefix-resume is
+     * nearest); 0 bytes and a null stage otherwise, which keeps every checkpoint at a chunk's
+     * end. A window section beside the linear state is not staged: the pages behind a checkpoint
+     * inside the step are still held when it ends (checkpoint_save_window). */
     int64_t ckpt_stage_bytes() const { return stage_bytes_; }
     void*   ckpt_stage() const { return stage_; }
     /* Per group (by index): the group's offset in the stage and its bytes a layer, -1 / 0 for a
@@ -706,9 +711,10 @@ private:
      * group that is not windowed. */
     bool apply_runtime_window(KVGroupPlan& p) const;
 
-    /* One traversal serving both checkpoint directions; see checkpoint_save. */
+    /* One traversal serving both checkpoint directions; see checkpoint_save. `window_only`: the
+     * linear section is walked (its offsets) and not copied. */
     int checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t ck_slot, bool save,
-                        RadStream s, const std::vector<int32_t>* win);
+                        RadStream s, const std::vector<int32_t>* win, bool window_only = false);
 
     struct Seq {
         uint64_t id = 0;

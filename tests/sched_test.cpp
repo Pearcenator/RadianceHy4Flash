@@ -831,6 +831,79 @@ TEST(a_tail_snapshot_inside_the_last_chunk_has_no_quarter_interval_floor) {
     CHECK_EQ(b_ck, 2048);
 }
 
+/* X-02: without a span, a prefill alone in its step (nothing else running, nothing to admit)
+ * takes its tail snapshot inside its last chunk too, and the batch carries the cut there
+ * (RadBatch::ckpt_cut). Beside another request, or planned outside a step, it keeps the cut
+ * schedule: the tail a step of its own. */
+TEST(a_lone_prefill_without_a_span_takes_its_tail_snapshot_inside_its_last_chunk) {
+    auto lone = [](bool inside, std::vector<std::pair<int32_t, int32_t>>* chunks,
+                   std::vector<int64_t>* cks, std::vector<int32_t>* cuts) {
+        Fixture f;
+        f.build(4096, 64, 2048);
+        f.cfg.checkpoint_interval = 1024;   /* quantum 64; a quarter interval is 256 */
+        CHECK_OK(f.start());
+        CHECK_EQ(f.sch.geometry().span, 1);
+        f.sch.set_ckpt_inside(inside);
+        const uint64_t a = f.submit(2400, 2);
+        for (int k = 0; k < 10; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            const StepEntry& e = f.sch.plan().e[0];
+            CHECK_EQ(f.sch.plan().e.size(), (size_t)1);
+            CHECK_EQ(e.seq, a);
+            if (!e.is_prefill) { f.commit_plain(); break; }
+            chunks->push_back({ e.ctx_len, e.n_tokens });
+            if (e.ckpt_tok >= 0) cks->push_back(e.ctx_len + e.ckpt_tok + 1);
+            cuts->push_back(b->ckpt_cut);
+            f.commit_plain();
+        }
+    };
+    std::vector<std::pair<int32_t, int32_t>> c0, c1;
+    std::vector<int64_t> k0, k1;
+    std::vector<int32_t> u0, u1;
+    /* The cut schedule: a chunk an interval, [2048, 2368) to the tail snapshot, then its 32
+     * rows a step of their own; no cut inside any step. */
+    lone(false, &c0, &k0, &u0);
+    REQUIRE_EQ(c0.size(), (size_t)4);
+    CHECK(c0[2] == std::make_pair(2048, 320));
+    CHECK(c0[3] == std::make_pair(2368, 32));
+    CHECK(k0 == std::vector<int64_t>({ 1024, 2048, 2368 }));
+    CHECK(u0 == std::vector<int32_t>({ 0, 0, 0, 0 }));
+    /* Inside: the same snapshots, the tail inside one last chunk [2048, 2400), cut at row 320. */
+    lone(true, &c1, &k1, &u1);
+    REQUIRE_EQ(c1.size(), (size_t)3);
+    CHECK(c1[2] == std::make_pair(2048, 352));
+    CHECK(k1 == k0);
+    CHECK(u1 == std::vector<int32_t>({ 0, 0, 320 }));
+
+    /* Outside a step, plan_chunk answers for a shared step: the cut. */
+    Fixture g;
+    g.build(4096, 64, 2048);
+    g.cfg.checkpoint_interval = 1024;
+    CHECK_OK(g.start());
+    g.sch.set_ckpt_inside(true);
+    int64_t ck = -1;
+    CHECK_EQ(g.sch.plan_chunk(2048, 2400, 2048, &ck), 320);
+    CHECK_EQ(ck, 2368);
+    /* Beside another request the tail stays a cut, and no step is cut inside. */
+    const uint64_t b = g.submit(2400, 2);
+    const uint64_t c = g.submit(100, 40);
+    (void)c;
+    int64_t b_ck = -1;
+    for (int k = 0; k < 30; ++k) {
+        const RadBatch* rb = g.sch.step();
+        if (!rb) break;
+        CHECK_EQ(rb->ckpt_cut, 0);
+        for (const StepEntry& e : g.sch.plan().e)
+            if (e.seq == b && e.is_prefill && e.ckpt_tok >= 0) {
+                b_ck = e.ctx_len + e.ckpt_tok + 1;
+                CHECK_EQ(e.ckpt_tok + 1, e.n_tokens);
+            }
+        g.commit_plain();
+    }
+    CHECK_EQ(b_ck, 2368);
+}
+
 /* A span moves no checkpoint and no piece, from a prompt's start or from any checkpoint a turn
  * resumes from: every chunk end and checkpoint it makes is one a span of 1 makes, and the deepest
  * checkpoint (where the next turn resumes) is the same. */

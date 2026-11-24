@@ -648,6 +648,13 @@ private:
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
+    /* Without a span: this step holds one prefill alone (nothing else runs or can be admitted),
+     * set by step() for the step it plans and false outside a step. With set_ckpt_inside its
+     * tail snapshot goes inside its last chunk (plan_chunk), as a lone spanned prefill's does. */
+    bool          lone_now_ = false;
+    /* step_next_locked is planning a mixed step (it plans no other): no snapshot inside a chunk,
+     * which needs the chunk alone in its step (RadBatch::ckpt_cut). */
+    bool          ahead_now_ = false;
     /* A request finished while others still run: the next step is planned at the shared budget,
      * not a span (step()), so that the finished conversation's next turn, which a client sends at
      * once, waits for a shared step rather than a spanned one. Consumed by that step. */

@@ -374,9 +374,20 @@ struct Indexer {
                         RAD_W(wg), RAD_W(ape), RAD_W(pool_gain), brows(w.zero_pos, work), RAD_NONE,
                         RAD_NONE, brows(t_group_keys.buf, work));
         }
-        /* After the gather: the tail's rows are what the next step's groups read. */
-        RAD_ISSUE_N(c, op_tail, T, brows(w.tk, T), pos, cu, kv_cache(tail, layer),
-                    praw2(tb->state_index, RAD_I32, S, pitch));
+        /* After the gather: the tail's rows are what the next step's groups read. A checkpoint
+         * inside the step (RadBatch::ckpt_cut): the ring over the rows before it, its snapshot,
+         * then the rest, as QsaIndexer::store_keys (a row writes its own position's slot). */
+        const int64_t ck = batch->ckpt_cut;
+        if (S == 1 && ck > 0 && ck < T && batch->ckpt_cu) {
+            for (int64_t q = 0; q < 2; ++q) {
+                RAD_ISSUE_N(c, op_tail, q == 0 ? ck : T - ck, brows(w.tk, T), pos,
+                            praw(batch->ckpt_cu + q, RAD_I32, 2), kv_cache(tail, layer),
+                            praw2(tb->state_index, RAD_I32, S, pitch));
+                if (q == 0) rad_ckpt_snap(c, tail, layer);
+            }
+        } else
+            RAD_ISSUE_N(c, op_tail, T, brows(w.tk, T), pos, cu, kv_cache(tail, layer),
+                        praw2(tb->state_index, RAD_I32, S, pitch));
         if (!p.select || !rows.n) {
             if (op_tap_nsel0) RAD_ISSUE_N(c, op_tap_nsel0, T, brows(t_nsel.buf, T));
             return true;

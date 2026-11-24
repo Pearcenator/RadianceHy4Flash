@@ -374,7 +374,24 @@ struct Engram {
                     (ahead_forced() || rad_op_domain(c, op_gather) == RAD_DOMAIN_HOST)
                 ? std::min<int64_t>(batch->n_ahead, EngramWire::kAheadChunks * g.max_tok)
                 : 0;
-        if (P > 0) {
+        const int64_t ck = batch->ckpt_cut;
+        if (P == 1 && D == 0 && ck > 0 && ck < T && batch->ckpt_cu) {
+            /* A checkpoint inside the step (RadBatch::ckpt_cut): the rows before it, the window's
+             * snapshot, then the rest with the ahead rows. The kernel takes a row's sequence from
+             * `cu` (rows outside it are skipped) and the ids before the piece's first row from
+             * the window the first piece left, so each piece hashes as a chunk of its rows. */
+            RadOperand sp = praw2(sidx, RAD_I32, 1, pitch);
+            sp.cols = 1;
+            for (int64_t q = 0; q < 2; ++q) {
+                const int64_t ahead = q == 1 ? A : 0;
+                RAD_ISSUE_N(c, op_ids, T, praw(batch->token_ids, RAD_I32, T + ahead),
+                            kv_cache(hist, layer), praw(batch->ckpt_cu + q, RAD_I32, 2), pos,
+                            RAD_W(map), RAD_W(mult), RAD_W(vsz), RAD_W(off), RAD_NONE, sp,
+                            brows(w.ids, T), brows(w.mask, T),
+                            ahead > 0 ? brows(w.ahead, ahead) : RAD_NONE);
+                if (q == 0) rad_ckpt_snap(c, hist, layer);
+            }
+        } else if (P > 0) {
             RadOperand sp = praw2(sidx + D * pitch, RAD_I32, P, pitch);
             sp.cols = 1;
             RAD_ISSUE_N(c, op_ids, T, praw(batch->token_ids, RAD_I32, T + A), kv_cache(hist, layer),

@@ -1319,9 +1319,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const StepPlan p = plan(m, batch);
     /* The step half of the pipeline gate: one sequence (the pieces are one chunk's rows), no media
      * rows (their reduction would have to pick a lane too), and both pieces above the band floor so
-     * each one's kernels are the ones the whole step's shape would have picked. */
+     * each one's kernels are the ones the whole step's shape would have picked. Not with a
+     * checkpoint inside the step: the routed arm's pieces would not end at it (MoeFP8::step cuts
+     * its runs there), and the rows before it must be what a chunk ending there computes. */
     const int64_t n0 = pipe_rows(T), n1 = T - n0;
-    const bool pipe = m.pipe_on && nmm == 0 && batch->n_seq == 1 && n0 >= pipe_min_rows() && n1 > 0;
+    const bool pipe = m.pipe_on && nmm == 0 && batch->n_seq == 1 && n0 >= pipe_min_rows() &&
+                      n1 > 0 && batch->ckpt_cut <= 0;
     RAD_ISSUE_N(c, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.x0, T));
     if (nmm > 0) {
         /* Rank 0 holds the rows, the others zeros: the exact sum gives every rank the rows. */
@@ -1533,6 +1536,15 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     {   /* RADIANCE_HY4_SHAPE_PROBE=0: no sizing declares (an A/B switch, hy4-perf). */
         const char* e = std::getenv("RADIANCE_HY4_SHAPE_PROBE");
         out->shape_probe_ok = (e && *e && std::strcmp(e, "0") == 0) ? 0 : 1;
+    }
+    /* A step of one prefill sequence with its checkpoint inside it (RadBatch::ckpt_cut): the
+     * indexer's tail ring and the Engram window are written in two pieces with the snapshot
+     * between them (hyv4flash_indexer.h, hyv4flash_engram.h), the routed arm cuts its runs there
+     * (MoeFP8::step) and the pipelined prefill stands down. RADIANCE_HY4_CKPT_SNAP=0: off (the
+     * tail step of its own, an A/B switch). */
+    {
+        const char* e = std::getenv("RADIANCE_HY4_CKPT_SNAP");
+        out->ckpt_snap_ok = (e && *e && std::strcmp(e, "0") == 0) ? 0 : 1;
     }
     return RAD_OK;
 }
